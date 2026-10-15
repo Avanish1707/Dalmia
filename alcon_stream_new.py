@@ -88,13 +88,13 @@ from face_association import (
 # CONFIGURATION
 # ============================================================
 
-DEFAULT_NVR_IP = os.getenv("NVR_IP", "115.247.225.82")
-NVR_USERNAME = "alcon"
+DEFAULT_NVR_IP = os.getenv("NVR_IP", "192.168.191.40")
+NVR_USERNAME = "admin"
 NVR_PASSWORD = os.getenv("ALCON_PASSWORD", "")
 
 RTSP_PORT = 554
-NVR_HTTP_PORT = int(os.getenv("NVR_HTTP_PORT", "554"))
-RTSP_PATH = "/cam/realmonitor"
+NVR_HTTP_PORT = int(os.getenv("NVR_HTTP_PORT", "80"))
+RTSP_PATH = "/Streaming/Chennels"
 RTSP_DEBUG = os.getenv("RTSP_DEBUG", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 RECOGNITION_THRESHOLD = float(os.getenv("RECOGNITION_THRESHOLD", "0.50"))
@@ -242,7 +242,7 @@ ALERT_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
 #
 PUBLIC_BASE_URL = os.getenv(
     "PUBLIC_BASE_URL",
-    "http://103.234.71.180:5000/"
+    "http://128.185.37.166:5000/"
 ).rstrip("/")
 
 
@@ -613,7 +613,69 @@ def _redact_rtsp_url(rtsp_url):
         return rtsp_url
 
 
+
 def build_rtsp_url(camera_config):
+    configured_url = (
+        camera_config.get("RTSP_URL")
+        or camera_config.get("rtsp_url")
+    )
+
+    if configured_url:
+        return configured_url.strip()
+
+    if not NVR_PASSWORD:
+        raise RuntimeError(
+            "ALCON_PASSWORD environment variable is not set."
+        )
+
+    username = quote(NVR_USERNAME, safe="")
+    password = quote(NVR_PASSWORD, safe="")
+
+    nvr_ip = camera_config.get("nvr_ip", DEFAULT_NVR_IP)
+    channel = int(camera_config.get("channel", 1))
+    subtype = int(camera_config.get("subtype", 1))
+
+    # subtype 0 = main stream; subtype 1 = substream
+    stream_number = 1 if subtype == 0 else 2
+    channel_path = channel * 100 + stream_number
+
+    return (
+        f"rtsp://{username}:{password}@{nvr_ip}:{RTSP_PORT}"
+        f"/Streaming/Channels/{channel_path}"
+    )
+
+    # Prefer the exact RTSP URL configured for this camera.
+    # Supports both the uppercase key shown in cameras.json
+    # and the lowercase alternative.
+    configured_url = (
+        camera_config.get("RTSP_URL")
+        or camera_config.get("rtsp_url")
+    )
+
+    if configured_url:
+        return configured_url.strip()
+
+    # Otherwise construct the Hikvision-style URL.
+    if not NVR_PASSWORD:
+        raise RuntimeError(
+            "ALCON_PASSWORD environment variable is not set."
+        )
+
+    user = quote(NVR_USERNAME, safe="")
+    password = quote(NVR_PASSWORD, safe="")
+
+    nvr_ip = camera_config.get("nvr_ip", DEFAULT_NVR_IP)
+    channel = int(camera_config.get("channel", 1))
+    subtype = int(camera_config.get("subtype", 1))
+
+    # Conventional mapping: subtype 0 = main, subtype 1 = substream.
+    stream_number = 1 if subtype == 0 else 2
+
+    return (
+        f"rtsp://{user}:{password}@{nvr_ip}:{RTSP_PORT}"
+        f"/Streaming/Channels/{channel}{stream_number}"
+    )
+
 
     if not NVR_PASSWORD:
 
