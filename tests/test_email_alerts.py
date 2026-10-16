@@ -165,3 +165,34 @@ def test_email_retry_only_retries_refused_recipients(monkeypatch):
     ]
     assert job["pending_recipients"] == []
     assert len(set(message_ids)) == 1
+
+
+def test_email_delivery_failure_logs_stage_and_redacts_credentials(
+    monkeypatch,
+    capsys,
+):
+    _set_mail_env(monkeypatch)
+    config = EmailConfig.from_env()
+
+    def failing_smtp(*_args, **_kwargs):
+        raise OSError(f"connection failed for {config.password}")
+
+    queue = EmailAlertQueue(
+        config,
+        max_attempts=1,
+        smtp_factory=failing_smtp,
+    )
+    queue._deliver_with_retries(
+        {
+            "event": {"id": "event-1"},
+            "attachment_path": None,
+            "pending_recipients": list(config.recipients),
+            "message_id": "message-1",
+        }
+    )
+
+    output = capsys.readouterr().out
+    assert "[EMAIL][DELIVERY] stage=attempt" in output
+    assert "[EMAIL][DELIVERY] stage=complete result=failed" in output
+    assert "connection failed for [redacted]" in output
+    assert config.password not in output

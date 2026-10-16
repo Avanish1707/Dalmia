@@ -1,16 +1,13 @@
 # ALCON Surveillance Backend
 
-Dalmia VMS is a Flask and Socket.IO surveillance service. It reads NVR RTSP
-streams, runs shared YOLO and InsightFace models, associates faces with
-person detections, recognizes registered employees, tracks ROI visits, saves
-finalized detection events, sends alert emails asynchronously, and provides
-an authenticated browser dashboard with annotated camera streams.
+Dalmia VMS is a Flask surveillance service. Its active camera path reads NVR
+RTSP streams, runs only InsightFace face detection and ArcFace recognition,
+sends confirmed unknown-face alerts by email, and provides an authenticated
+browser dashboard with annotated camera streams.
 
-This repository is being refactored incrementally. The active behavior still
-lives in `alcon_stream_new.py`; the package modules introduced so far are
-compatibility boundaries and small ownership modules. That distinction is
-intentional: moving a stateful function is only safe after its shared state
-and import dependencies have been identified.
+The active camera behavior lives in `alcon_stream_new.py`; other detector and
+event modules remain available in the repository but are not used by the
+current face-only camera path.
 
 ## Run
 
@@ -22,7 +19,7 @@ Use the project virtual environment on Windows:
 
 The server listens on `0.0.0.0:5000` by default. `python app.py` imports the
 `main()` entry point from `alcon_stream_new.py`, initializes email delivery
-when configured, loads the models and database, starts enabled camera
+when configured, loads the face model and database, starts enabled camera
 workers, and runs Flask-Socket.IO with the threaded async mode.
 
 ## Current Architecture
@@ -32,30 +29,22 @@ app.py
   -> alcon_stream_new.main()
 		 -> bounded asynchronous email-alert worker (when configured)
 		 -> camera configuration and state initialization
-		 -> shared YOLO person model
-		 -> shared YOLO vehicle model
-		 -> one shared InsightFace buffalo_s instance with ArcFace
+		 -> one shared InsightFace buffalo_s instance with only face detection
+		    and ArcFace
 		    w600k_mbf recognition for every enabled camera worker
 		 -> registered-face cache and auth accounts
-		 -> one DetectionEventManager per enabled camera
 		 -> CameraManager
 				-> one camera_worker thread per enabled camera
 					  -> RTSP read/reconnect
-					  -> person detection
-					  -> optional vehicle detection
-					  -> InsightFace detection
-					  -> face/person/ROI validation
-					  -> individual-template recognition
-					  -> camera-local identity memory
-					  -> event manager and latest annotated-frame buffer
+					  -> face detection and known/unknown recognition only
+					  -> confirmed unknown-face email queue
+					  -> annotated-frame buffer
   -> authenticated dashboard and HTTP MJPEG streams
 ```
 
 `app.py` is already a small launcher. `camera/manager.py` owns worker
-lifecycle. `events/detection_events.py` owns the packaged
-`DetectionEventManager`, and `database/detection_database.py` owns persisted
-detection records. `camera/rtsp.py`, `ai/models.py`, and the root-level
-compatibility files currently re-export behavior from the active monolith.
+lifecycle. Other detector and event modules remain in the repository but are
+not initialized or called by the current face-only camera path.
 
 ## Project Map
 
@@ -64,22 +53,18 @@ compatibility files currently re-export behavior from the active monolith.
 | Entrypoint | `app.py`, `alcon_stream_new.py` | `main`, Flask app, Socket.IO setup, signal shutdown |
 | Settings | `config/settings.py`, `alcon_stream_new.py` | Paths, environment values, thresholds, model names |
 | Cameras | `config/cameras.py`, `config/cameras.json` | `load_cameras`, `CAMERAS`, `enabled_cameras`, NVR/channel/subtype/KPI |
-| ROI | `roi/camera_rois.py` | `PERSON_ROI_POLYGON`, `VEHICLE_ROI`, `get_camera_roi` |
 | RTSP | `alcon_stream_new.py`, `camera/rtsp.py` | `build_rtsp_url`, `configure_h264_stream`, OpenCV capture and reconnect |
 | Camera lifecycle | `camera/manager.py` | `CameraManager`, `ManagedWorker` |
 | Frame pipeline | `alcon_stream_new.py` | `camera_worker` |
-| CPU/model execution | `alcon_stream_new.py`, `ai/models.py` | serialized CPU inference, one person YOLO, one vehicle YOLO, shared buffalo_s/ArcFace FaceAnalysis |
-| Person detection | `alcon_stream_new.py`, `ai/person.py` | `safe_person_inference`, `detect_person_boxes` |
-| Vehicle detection | `alcon_stream_new.py`, `ai/vehicle.py` | `safe_vehicle_inference`, `detect_vehicle_boxes`, vehicle ROI and validation |
+| CPU/model execution | `alcon_stream_new.py` | shared `buffalo_s` face detection and ArcFace recognition on CPU |
 | Face detection | `alcon_stream_new.py`, `ai/face.py` | `safe_face_inference`, InsightFace geometry checks |
 | Recognition | `alcon_stream_new.py` | `normalize_embedding`, `recognize_face`, five individual templates per person |
-| Identity memory | `alcon_stream_new.py` | `_same_face_track`, camera-local `known_face_memory`, timeout and retention |
+| Unknown face confirmation | `face_only.py` | `FaceOnlyUnknownTracker`, spatial matching and two-hit confirmation |
 | Face cache | `alcon_stream_new.py` | `load_known_faces`, `refresh_known_faces_cache`, `known_face_templates`, metadata |
 | Database | `database/detection_database.py`, `alcon_stream_new.py` | detection records plus registration, embeddings, auth, FCM token SQL |
-| Events | `events/detection_events.py` | ROI tracking, exit confirmation, deduplication, image and event persistence |
-| Notifications | `notifications/email.py`, `alcon_stream_new.py` | Bounded email queue, SMTP delivery, legacy FCM compatibility |
-| Storage | `alcon_stream_new.py`, `events/detection_events.py` | `known_faces/<storage_key>/image_N.jpg`, alert images |
-| API and Socket.IO | `alcon_stream_new.py` | Flask routes, authenticated dashboard/MJPEG streams, `face_alert`, `detection_event`, camera rooms |
+| Alerts | `notifications/email.py`, `alcon_stream_new.py` | Unknown face confirmation, bounded email queue, SMTP delivery |
+| Storage | `alcon_stream_new.py` | `known_faces/<storage_key>/image_N.jpg`, alert images |
+| API and Socket.IO | `alcon_stream_new.py` | Flask routes and authenticated dashboard/MJPEG streams |
 
 ## Shared Runtime State
 
@@ -88,15 +73,12 @@ refactor:
 
 - `CAMERAS`
 - `camera_states`, `camera_captures`, `latest_annotated_frames`
-- `camera_event_managers`
 - `known_embeddings`, `known_face_templates`, `known_person_metadata`
-- `person_detector`, `vehicle_detector`, `face_app`
+- `face_app`
 - `model_inference_lock` and its face-inference compatibility alias
 - `alert_history`, `connected_clients`, `shutdown_event`, `camera_manager`
 
-Camera worker state such as unknown presence, last vehicles, last faces, and
-identity memory is deliberately local to each worker. Do not replace it with
-a process-wide dictionary unless the behavior is kept camera-specific.
+Unknown face tracking is local to each worker.
 
 ## Configuration
 
@@ -104,7 +86,7 @@ Camera definitions remain in `config/cameras.json`. Each item contains the
 camera ID, display name, NVR address, KPI, enabled flag, channel, and subtype.
 CAM001 uses the `known_unknown` KPI for annotated known/unknown person detection;
 vehicle inference is enabled only for cameras configured with the `vehicle` KPI.
-YOLO and InsightFace inference are pinned to CPU, regardless of GPU availability.
+InsightFace face detection and recognition are pinned to CPU, regardless of GPU availability.
 The shared `buffalo_s` face pipeline requires its `w600k_mbf.onnx` ArcFace
 recognition model and is used by all enabled camera workers.
 Known-face embeddings are model-specific; after changing from `buffalo_l`,
@@ -262,10 +244,9 @@ exactly-one-face rule.
    is not initialized as a prerequisite for detection alerts.
 4. Enabled camera records are loaded and camera state dictionaries are created.
 5. H.264 configuration is requested from each enabled NVR using HTTP digest auth.
-6. The person YOLO model, InsightFace `buffalo_s` with its ArcFace
-	`w600k_mbf.onnx` recognizer, and vehicle YOLO model are loaded once per
-	process and shared by enabled camera workers.
-7. One `DetectionEventManager` is created for each enabled camera.
+6. InsightFace `buffalo_s` is loaded with only its face detection and ArcFace
+	`w600k_mbf.onnx` recognition modules, then shared by enabled cameras.
+7. Other detector models and `DetectionEventManager` are not initialized.
 8. The SQLite schema is checked without replacing the existing database.
 9. Registered face embeddings and metadata are loaded into the live cache.
 10. Default admin/user accounts are inserted only when absent.
@@ -275,22 +256,12 @@ exactly-one-face rule.
 ### Per-camera frame processing
 
 Each worker repeatedly opens its configured RTSP URL and reconnects after
-repeated read failures. Every second frame is processed. The worker:
-
-1. Detects person boxes with YOLO class `0` and existing plausibility checks.
-2. Runs vehicle YOLO on CPU only for vehicle-KPI cameras at the existing cadence.
-3. Filters vehicles through the current camera's `vehicle.points` polygon;
-	the box center or bottom-center must be inside the polygon.
-4. Runs InsightFace under the one global inference lock.
-5. Rejects low-confidence, geometrically invalid, out-of-ROI, or
-	non-person-associated faces.
-6. Matches the live embedding against every stored template for every person.
-7. Establishes or retains identity only when spatial continuity confirms the
-	same active track. Memory expires after the configured timeout.
-8. Builds known, unknown, vehicle, and camera-specific event payloads.
-9. Passes tracked events to `DetectionEventManager`.
-10. Draws the existing annotations, resizes and JPEG-encodes the frame, and
-	 updates the camera's latest-frame buffer for HTTP MJPEG clients.
+repeated read failures. Every configured processing frame runs InsightFace
+detection and recognition only. Unknown faces must pass the face score gate
+and appear in two detections of the same spatial track; the worker then saves
+annotated evidence and submits one email. It does not run YOLO, ROI tracking,
+database event persistence, or Socket.IO detection alerts. Annotated frames
+remain available through the dashboard's MJPEG stream.
 
 ### Recognition
 
@@ -304,50 +275,44 @@ recognition. `known_embeddings` remains as a legacy compatibility cache.
 
 ### Event and alert workflow
 
-`DetectionEventManager` tracks person and vehicle boxes within each camera's
-ROI. Events are finalized on confirmed exits, use the configured historical
-frame offset for the image, and are written through `DetectionDatabase`.
-Unknown groups are held until the last member exits. Alert deduplication,
-unknown presence timing, and vehicle context remain camera-aware.
+The active camera-worker path runs only InsightFace face detection and ArcFace
+recognition. Person/vehicle/PPE/fall/smoke-fire/object-theft model
+initialization and event tracking are disabled. Each face is associated across
+two inference frames; a validated unknown face is emailed directly and is not
+sent through Socket.IO or the detection-event manager.
 
 #### Why a face may not become an unknown-person detection
 
-Face detection and unknown classification are separate stages. A person must
-first be detected by YOLO inside that camera's configured person ROI; then
-InsightFace must return a plausible face associated with that same person
-track, with at least two temporal confirmations. Faces below
-`FACE_RECOGNITION_MIN_DET_SCORE` (default `0.40`) are rejected. Even an
-accepted face is only eligible as an unknown when its face detector score is
-at least `UNKNOWN_FACE_MIN_SCORE` (default `0.60`) and all person/ROI/face
-validation gates pass.
+InsightFace runs on each camera frame without a YOLO person detector or ROI
+gate. Invalid face geometry and detections below
+`FACE_RECOGNITION_MIN_DET_SCORE` (default `0.40`) are rejected. An unknown
+must also meet `UNKNOWN_FACE_MIN_SCORE` (default `0.60`) and be confirmed on
+two inference frames before email is attempted.
 
-The recognition matcher also deliberately holds borderline matches as
-`PENDING`: candidate similarity at/above `RECOGNITION_CANDIDATE_THRESHOLD`
-(default `0.43`) that fails the known threshold (`0.50`) or margin (`0.05`)
-does not become an unknown alert. This avoids incorrectly alerting on a
-possible registered person. Logs show `[FACE] REJECTED`, `[FACE] CANDIDATE`,
-`[FACE] UNKNOWN`, and `[UNKNOWN COUNT]`; a confirmed detection event is
-persisted and alerted only after the tracked person exits the ROI and that
-exit is confirmed. Check those lines by camera ID to identify the specific
-gate preventing an unknown event. Do not lower thresholds without validating
-false-positive rates on representative camera footage.
+The recognition matcher deliberately holds borderline matches as `PENDING`:
+candidate similarity at/above `RECOGNITION_CANDIDATE_THRESHOLD` (default
+`0.43`) that fails the known threshold (`0.50`) or margin (`0.05`) is not
+emailed as unknown. This avoids alerting on a possible registered person.
+Follow `[FACE-ONLY][DETECT]`, `[FACE-ONLY][REJECT]`,
+`[FACE-ONLY][IDENTITY]`, and `[FACE-ONLY][EMAIL]` logs to find the exact
+decision stage for each camera.
 
-Unknown-person email is queued only after that confirmed ROI exit. Configure
+Unknown-person email is queued after two matching unknown-face detections.
+Configure
 `MAIL_HOST`, `MAIL_PORT`, `MAIL_FROM`, `ALERT_EMAIL_TO`, and the required
 transport/authentication values in the deployment environment. At startup,
-`[WARNING] Email alerts are not configured` means no email worker was started;
-`[UNKNOWN] EMAIL_QUEUE_RESULT | queued=False` means the finalized detection
-could not be queued. A queued email can still fail during SMTP delivery; check
-`[ERROR] Email alert delivery failed` and `[INFO] Email alert sent` logs.
+`[FACE-ONLY][EMAIL] stage=startup result=disabled` means no email worker was
+started. `stage=queue result=failed` means the event was not accepted by the
+queue. `[EMAIL][DELIVERY] stage=attempt` confirms SMTP delivery began;
+`stage=complete result=failed` reports the SMTP error, and `result=sent`
+confirms successful delivery.
 
-Finalized events emit `detection_event`. Person alerts are appended to the
-bounded in-memory `alert_history` and emitted as `face_alert`. Configured
-non-known detection alerts are queued for email delivery after the existing
-deduplication and persistence steps; the camera worker never performs SMTP
-requests. Evidence images are attached when available. SMTP failures retry a
-bounded number of times and do not interrupt inference. Firebase/FCM token
-registration code is retained for compatibility with separate mobile clients,
-but is not required for this email-alert path.
+Only confirmed unknown-face detections from the camera worker are sent through
+the detection email queue. They do not emit `face_alert` or
+`detection_event` Socket.IO messages. Evidence images are attached when
+available. SMTP failures retry a bounded number of times and do not interrupt
+face inference. Firebase/FCM registration routes remain for mobile-client
+compatibility but are not used for unknown-face email alerts.
 
 ### Browser dashboard and email setup
 

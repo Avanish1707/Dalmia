@@ -37,11 +37,6 @@ import cv2
 import numpy as np
 from PIL import Image, ImageOps
 
-try:
-    from ultralytics import YOLO
-except ImportError:
-    YOLO = None
-
 from dotenv import load_dotenv
 
 # Load deployment switches before importing camera and KPI configuration
@@ -51,41 +46,12 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 from database import validate_postgres_connection
 from insightface.app import FaceAnalysis
 from detection_database import DetectionDatabase
-from detection_events import DetectionEventManager
 from camera.manager import CameraManager, LatestFrameStore
 from camera.rtsp_url import build_rtsp_url, redact_rtsp_url
 from notifications.email import EmailAlertQueue, EmailConfig
 from config.cameras import CAMERAS, enabled_cameras
 from roi.camera_rois import get_camera_roi
-from fall_detection import FallDetector
-from fall_detection.fall_config import (
-    FALL_DETECTION_ENABLED,
-    FALL_ENABLED,
-    FALL_MODEL_PATH,
-)
-from ppe_detection import PPEDetector
-from ppe_detection.ppe_config import (
-    HELMET_DETECTION_ENABLED,
-    PPE_ANNOTATION_ENABLED,
-    PPE_ENABLED,
-    PPE_MODEL_PATH,
-)
-from smoke_fire_detection import SmokeFireDetector
-from smoke_fire_detection.smoke_fire_config import (
-    FIRE_DETECTION_ENABLED,
-    SMOKE_FIRE_ENABLED,
-    SMOKE_FIRE_MODEL_PATH,
-    SMOKE_FIRE_TEST_MODE,
-)
-from object_theft import ObjectTheftDetector
-from object_theft.config import (
-    OBJECT_THEFT_CAMERAS,
-    OBJECT_THEFT_CONFIDENCE_THRESHOLD,
-    OBJECT_THEFT_ENABLED,
-    OBJECT_THEFT_IOU_THRESHOLD,
-    OBJECT_THEFT_MODEL_PATH,
-    OBJECT_THEFT_ROI_ENABLED,
-)
+from face_only import FaceOnlyUnknownTracker
 from face_association import (
     face_associated_with_person as _face_associated_with_person,
     face_box_inside_person,
@@ -105,8 +71,6 @@ NVR_PASSWORD = os.getenv("ALCON_PASSWORD", "")
 RTSP_PORT = 554
 NVR_HTTP_PORT = int(os.getenv("NVR_HTTP_PORT", "80"))
 RTSP_PATH = "/Streaming/Chennels"
-RTSP_DEBUG = os.getenv("RTSP_DEBUG", "false").strip().lower() in {"1", "true", "yes", "on"}
-
 RECOGNITION_THRESHOLD = float(os.getenv("RECOGNITION_THRESHOLD", "0.50"))
 RECOGNITION_CANDIDATE_THRESHOLD = float(
     os.getenv("RECOGNITION_CANDIDATE_THRESHOLD", "0.43")
@@ -197,21 +161,13 @@ PERSON_MODEL = os.getenv("PERSON_MODEL", "yolo11n.pt")
 PERSON_CONFIDENCE = float(os.getenv("PERSON_CONFIDENCE", "0.45"))
 PERSON_IOU = float(os.getenv("PERSON_IOU", "0.45"))
 PERSON_DEDUP_IOU = float(os.getenv("PERSON_DEDUP_IOU", "0.50"))
-
 INFERENCE_DEVICE = "cpu"
 VEHICLE_MODEL_PATH = "yolo26l.pt"
 VEHICLE_CONFIDENCE = 0.45
-TWO_WHEELER_CLASSES = {
-    "motorcycle"
-}
-FOUR_WHEELER_CLASSES = {
-    "car",
-    "bus",
-    "truck"
-}
+TWO_WHEELER_CLASSES = {"motorcycle"}
+FOUR_WHEELER_CLASSES = {"car", "bus", "truck"}
 VEHICLE_PROCESS_EVERY_N_FRAMES = 2
 VEHICLE_DEDUP_IOU = float(os.getenv("VEHICLE_DEDUP_IOU", "0.50"))
-
 AUTH_PASSWORD_HASH_ITERATIONS = int(
     os.getenv("AUTH_PASSWORD_HASH_ITERATIONS", "210000")
 )
@@ -347,7 +303,6 @@ camera_running = True
 camera_status = "Starting..."
 shutdown_event = threading.Event()
 camera_states = {}
-camera_event_managers = {}
 camera_state_lock = threading.Lock()
 camera_manager = None
 camera_captures = {}
@@ -366,12 +321,6 @@ face_confirmation_state = {}
 face_app = None
 person_detector = None
 vehicle_detector = None
-detection_events = None
-fall_detector = None
-ppe_detector = None
-smoke_fire_detector = None
-object_theft_detector = None
-
 unknown_present = False
 unknown_first_seen = 0.0
 unknown_last_seen = 0.0
@@ -614,20 +563,6 @@ def get_onnx_providers():
 def initialize_face_model():
 
     global face_app
-    global person_detector
-    global vehicle_detector
-
-    if YOLO is None:
-        raise RuntimeError(
-            "Person detection requires ultralytics. "
-            "Install dependencies from requirements.txt."
-        )
-
-    print(
-        f"[INFO] Loading person detector: {PERSON_MODEL}..."
-    )
-    person_detector = YOLO(PERSON_MODEL)
-    print("[OK] Person detector loaded.")
 
     providers = get_onnx_providers()
 
@@ -638,6 +573,7 @@ def initialize_face_model():
 
     face_app = FaceAnalysis(
         name="buffalo_s",
+        allowed_modules=["detection", "recognition"],
         providers=providers
     )
     recognition_model = face_app.models.get("recognition")
@@ -662,107 +598,11 @@ def initialize_face_model():
         "camera_scope=all_enabled_cameras"
     )
 
-    print(
-        f"[INFO] Loading vehicle detector: {VEHICLE_MODEL_PATH}..."
-    )
-    vehicle_detector = YOLO(VEHICLE_MODEL_PATH)
-    print("[OK] Vehicle detector loaded.")
-
     print("[OK] Face model loaded.")
     print(
         "[FACE MODEL] pack=buffalo_s "
         f"recognition=ArcFace({recognition_model_file})"
     )
-
-
-def initialize_fall_detector():
-    """Load the independent pose model once; existing models remain untouched."""
-    global fall_detector
-    if not FALL_ENABLED:
-        print("[INFO] Fall detection disabled by FALL_DETECTION_ENABLED.")
-        return
-    if YOLO is None:
-        raise RuntimeError("Fall detection requires ultralytics.")
-    print(f"[INFO] Loading fall pose detector: {FALL_MODEL_PATH}...")
-    fall_detector = FallDetector(FALL_MODEL_PATH, YOLO)
-    print("[OK] Fall pose detector loaded.")
-    print("[FALL] ENABLED | scope=CAM008_ONLY")
-
-
-def initialize_ppe_detector():
-    """Load PPE once and fail closed without affecting established KPIs."""
-    global ppe_detector
-    if not PPE_ENABLED:
-        print("[INFO] PPE detection disabled by HELMET_DETECTION_ENABLED.")
-        return
-    if YOLO is None:
-        print("[WARNING] PPE detection disabled: ultralytics is unavailable.")
-        return
-    try:
-        print(f"[INFO] Loading PPE detector: {PPE_MODEL_PATH}...")
-        ppe_detector = PPEDetector(PPE_MODEL_PATH, YOLO)
-        actual_classes = list(ppe_detector.class_names.values())
-        supported = sorted(set(ppe_detector.supported_classes.values()))
-        required = {"Helmet", "Safety Vest", "Gloves", "Mask", "Safety Boots"}
-        missing = sorted(required - set(supported))
-        print(f"[PPE MODEL] classes={actual_classes}")
-        print(f"[PPE MODEL] supported={supported} missing={missing}")
-        print("[OK] PPE detector loaded (only confirmed Helmet sessions alert).")
-        print("[HELMET] ENABLED | scope=CAM008_ONLY")
-    except Exception as error:
-        ppe_detector = None
-        print(f"[WARNING] PPE detection disabled; model load failed: {error}")
-
-
-def initialize_smoke_fire_detector():
-    """Load the independent smoke/fire model once without interrupting other KPIs."""
-    global smoke_fire_detector
-    if not SMOKE_FIRE_ENABLED:
-        print("[INFO] Smoke/fire detection disabled by FIRE_DETECTION_ENABLED.")
-        return
-    if YOLO is None:
-        print("[WARNING] Smoke/fire detection disabled: ultralytics is unavailable.")
-        return
-    try:
-        print(f"[INFO] Loading smoke/fire detector: {SMOKE_FIRE_MODEL_PATH}...")
-        smoke_fire_detector = SmokeFireDetector(SMOKE_FIRE_MODEL_PATH, YOLO)
-        print(
-            "[OK] Smoke/fire detector loaded "
-            f"(test_mode={SMOKE_FIRE_TEST_MODE})."
-        )
-        print("[FIRE] ENABLED | scope=ALL_ENABLED_CAMERAS")
-    except Exception as error:
-        smoke_fire_detector = None
-        print(f"[WARNING] Smoke/fire detection disabled; model load failed: {error}")
-
-
-def initialize_object_theft_detector():
-    """Load the isolated Object Theft KPI only when it is enabled for CAM008."""
-    global object_theft_detector
-    if not OBJECT_THEFT_ENABLED:
-        print("[OBJECT THEFT] enabled=False")
-        object_theft_detector = None
-        return
-    scopes = ",".join(sorted(OBJECT_THEFT_CAMERAS)) if OBJECT_THEFT_CAMERAS else "CAM008"
-    print(f"[OBJECT THEFT] enabled=True camera_scope={scopes}")
-    try:
-        object_theft_detector = ObjectTheftDetector(
-            model_path=OBJECT_THEFT_MODEL_PATH or None,
-            model_loader=None,
-            confidence=OBJECT_THEFT_CONFIDENCE_THRESHOLD,
-            iou=OBJECT_THEFT_IOU_THRESHOLD,
-        )
-        if object_theft_detector.model is None:
-            object_theft_detector = None
-            print("[OBJECT THEFT] model_loaded=False camera_scope=CAM008 status=DISABLED")
-        else:
-            print(
-                f"[OBJECT THEFT] model_loaded=True "
-                f"model_path={OBJECT_THEFT_MODEL_PATH or 'unset'}"
-            )
-    except Exception as error:
-        object_theft_detector = None
-        print(f"[OBJECT THEFT] MODEL LOAD FAILED camera_scope=CAM008 status=DISABLED error={error}")
 
 
 # ============================================================
@@ -1960,7 +1800,7 @@ def initialize_auth_accounts():
 
 
 def safe_model_inference(operation, *args, **kwargs):
-    """Serialize model calls and pin YOLO prediction to CPU."""
+    """Serialize compatible YOLO calls and explicitly select CPU inference."""
     if getattr(operation, "__name__", "") == "predict":
         kwargs["device"] = INFERENCE_DEVICE
     with model_inference_lock:
@@ -2335,17 +2175,27 @@ def _registration_image_diagnostics(raw, image, orientation):
 
 
 def safe_person_inference(frame):
-    """Serialize shared YOLO person inference on CPU."""
     if person_detector is None:
-        raise RuntimeError("Person detector is not initialized.")
-    return safe_model_inference(person_detector.predict, frame, classes=[0], conf=PERSON_CONFIDENCE, iou=PERSON_IOU, verbose=False)
+        raise RuntimeError("Person detector is disabled in face-only mode.")
+    return safe_model_inference(
+        person_detector.predict,
+        frame,
+        classes=[0],
+        conf=PERSON_CONFIDENCE,
+        iou=PERSON_IOU,
+        verbose=False,
+    )
 
 
 def safe_vehicle_inference(frame):
-    """Serialize shared YOLO vehicle inference on CPU."""
     if vehicle_detector is None:
-        raise RuntimeError("Vehicle detector is not initialized.")
-    return safe_model_inference(vehicle_detector.predict, frame, conf=VEHICLE_CONFIDENCE, verbose=False)
+        raise RuntimeError("Vehicle detector is disabled in face-only mode.")
+    return safe_model_inference(
+        vehicle_detector.predict,
+        frame,
+        conf=VEHICLE_CONFIDENCE,
+        verbose=False,
+    )
 
 
 def recognize_face(face, camera_id=None):
@@ -3045,133 +2895,102 @@ def save_alert_image(frame):
 
 def _queue_email_alert(event, attachment_path=None):
     if email_alert_queue is None:
-        print("[WARNING] Email alert not queued: email delivery is not configured.")
+        print(
+            "[FACE-ONLY][EMAIL] stage=queue result=failed "
+            "reason=email_worker_not_configured"
+        )
         return False
     return email_alert_queue.submit(event, attachment_path=attachment_path)
-
-
-# ============================================================
-# ALERT HANDLING
-# ============================================================
-
-def push_alert(
-    message,
-    frame,
-    gate_name=None,
-    camera_id=None,
-    camera_name=None
-):
-
-    gate_name = gate_name or _default_camera()["name"]
-
-    # --------------------------------------------------------
-    # Generate ID and save image
-    # --------------------------------------------------------
-
-    try:
-
-        (
-            notification_id,
-            image_url
-        ) = save_alert_image(frame)
-
-    except Exception as e:
-
-        print(
-            f"[ERROR] Alert image save failed: {e}"
-        )
-
-        notification_id = str(
-            uuid.uuid4()
-        )
-
-        image_url = ""
-
-
-    # --------------------------------------------------------
-    # Local alert history
-    # --------------------------------------------------------
-
-    entry = {
-        "id": notification_id,
-        "time": time.time(),
-        "message": message,
-        "gate": gate_name,
-        "camera_id": camera_id,
-        "camera_name": camera_name or gate_name,
-        "image_url": image_url,
-        "type": "person_detected"
-    }
-
-    alert_history.append(entry)
-
-
-    # --------------------------------------------------------
-    # React Native foreground Socket.IO clients
-    # --------------------------------------------------------
-
-    socketio.emit(
-        "face_alert",
-        entry
-    )
-
-
-    attachment_filename = Path(urlsplit(image_url).path).name if image_url else ""
-    return _queue_email_alert(
-        {
-            "id": notification_id,
-            "title": "New Person Detected",
-            "message": message,
-            "detection_type": "person_detected",
-            "detected_at": entry["time"],
-            "camera_id": camera_id,
-            "camera_name": camera_name or gate_name,
-            "gate_name": gate_name,
-            "image_url": image_url,
-        },
-        attachment_path=(
-            ALERT_IMAGE_DIR / attachment_filename if attachment_filename else None
-        ),
-    )
 
 
 def initialize_email_alerts():
     global email_alert_queue
 
-    config = EmailConfig.from_env()
+    try:
+        config = EmailConfig.from_env()
+    except ValueError as error:
+        print(
+            "[FACE-ONLY][EMAIL] stage=startup result=configuration_error "
+            f"error={error}"
+        )
+        raise
     if config is None:
         email_alert_queue = None
         print(
-            "[WARNING] Email alerts are not configured; "
-            "set MAIL_HOST, MAIL_PORT, MAIL_FROM, and ALERT_EMAIL_TO."
+            "[FACE-ONLY][EMAIL] stage=startup result=disabled "
+            "reason=mail_configuration_missing "
+            "required=MAIL_HOST,MAIL_PORT,MAIL_FROM,ALERT_EMAIL_TO"
         )
         return
     email_alert_queue = EmailAlertQueue(config)
     email_alert_queue.start()
+    print("[FACE-ONLY][EMAIL] stage=startup result=ready")
 
 
-def initialize_detection_events():
-
-    global detection_events
-    global camera_event_managers
-
-    camera_event_managers = {}
-
-    for camera_config in _enabled_cameras():
-        camera_event_managers[camera_config["camera_id"]] = DetectionEventManager(
-            database=detection_database,
-            image_dir=ALERT_IMAGE_DIR,
-            public_base_url=PUBLIC_BASE_URL,
-            socketio=socketio,
-            email_sender=_queue_email_alert,
-            dedup_seconds=EXIT_CONFIRM_SECONDS,
-            exit_frame_offset=EXIT_FRAME_OFFSET,
-            camera_id=camera_config["camera_id"],
-            camera_name=camera_config["name"],
+def _send_face_only_unknown_email(camera_id, camera_name, face, score, frame):
+    try:
+        notification_id, image_url = save_alert_image(frame)
+    except Exception as error:
+        print(
+            f"[FACE-ONLY][EMAIL] camera={camera_id} stage=evidence "
+            f"result=failed error_type={type(error).__name__}"
         )
+        return False
 
-    default_camera = _default_camera()["camera_id"]
-    detection_events = camera_event_managers.get(default_camera)
+    event = {
+        "id": notification_id,
+        "title": "Unknown Person Detected",
+        "message": f"Unknown person detected by face recognition at {camera_name}",
+        "detection_type": "unknown_person",
+        "recognition_state": "UNKNOWN",
+        "person_name": "Unknown",
+        "confidence": float(score),
+        "face_detection_score": float(getattr(face, "det_score", 0.0)),
+        "camera_id": camera_id,
+        "camera_name": camera_name,
+        "gate_name": camera_name,
+        "detected_at": time.time(),
+        "image_url": image_url,
+    }
+    attachment_path = ALERT_IMAGE_DIR / Path(urlsplit(image_url).path).name
+    try:
+        queued = _queue_email_alert(event, attachment_path=attachment_path)
+    except Exception as error:
+        print(
+            f"[FACE-ONLY][EMAIL] camera={camera_id} stage=queue "
+            f"result=error error_type={type(error).__name__}"
+        )
+        return False
+    print(
+        f"[FACE-ONLY][EMAIL] camera={camera_id} stage=queue "
+        f"result={'queued' if queued else 'failed'} event_id={event['id']}"
+    )
+    return queued
+
+
+def _annotate_face_only_frame(frame, face_results):
+    annotated = frame.copy()
+    height, width = annotated.shape[:2]
+    for face, name, score, identity_state in face_results:
+        x1, y1, x2, y2 = np.asarray(face.bbox, dtype=np.int32).reshape(4)
+        x1, x2 = max(0, min(x1, width - 1)), max(0, min(x2, width - 1))
+        y1, y2 = max(0, min(y1, height - 1)), max(0, min(y2, height - 1))
+        color = (0, 0, 255) if identity_state == "UNKNOWN" else (
+            (0, 200, 0) if identity_state == "KNOWN" else (0, 200, 255)
+        )
+        label = f"{name} {score:.2f}"
+        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
+        cv2.putText(
+            annotated,
+            label,
+            (x1, max(20, y1 - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            color,
+            2,
+            cv2.LINE_AA,
+        )
+    return annotated
 
 
 # ============================================================
@@ -3182,48 +3001,17 @@ def camera_worker(camera_config, rtsp_url=None):
 
     camera_id = camera_config["camera_id"]
     camera_name = camera_config["name"]
-    gate_name = camera_name
-    detection_manager = camera_event_managers.get(camera_id)
     state = camera_states.get(camera_id)
-
-    # CameraManager creates workers exclusively from _enabled_cameras(). The
-    # three global switches therefore apply to every enabled worker and never
-    # to a disabled camera, without maintaining per-KPI camera lists.
-    if fall_detector is not None and FALL_DETECTION_ENABLED:
-        scope = "CAM008_ONLY" if _should_run_kpi(camera_id, "fall") else "DISABLED"
-        _camera_log(camera_id, f"[FALL] ENABLED | scope={scope}")
-    if smoke_fire_detector is not None and FIRE_DETECTION_ENABLED:
-        _camera_log(camera_id, "[FIRE] ENABLED | scope=ALL_ENABLED_CAMERAS")
-    if ppe_detector is not None and HELMET_DETECTION_ENABLED:
-        scope = "CAM008_ONLY" if _should_run_kpi(camera_id, "helmet") else "DISABLED"
-        _camera_log(camera_id, f"[HELMET] ENABLED | scope={scope}")
 
     frame_counter = 0
     camera_status = "Starting..."
-    last_alert_time = 0.0
-    unknown_present = False
-    unknown_first_seen = 0.0
-    unknown_last_seen = 0.0
-
-    last_faces = []
-    last_event_people = []
-    last_vehicles = []
-    last_ppe_detections = []
-    last_smoke_fire_detections = []
-
-    known_face_memory = []
-    person_tracks = []
-    next_person_track_id = 1
-
-    unknown_frame_history = deque(maxlen=5)
-    max_unknown_count = 0
-    unknown_alert_sent = False
-    last_detection_log_time = 0.0
+    face_only_tracker = FaceOnlyUnknownTracker(
+        confirm_frames=2,
+        track_timeout=UNKNOWN_GONE_CLEARANCE,
+    )
+    face_only_results = []
 
     last_emit_time = 0.0
-    last_frame_diagnostic_time = 0.0
-    last_latency_diagnostic_time = 0.0
-    last_rtsp_debug_time = 0.0
     emit_interval = 1.0 / max(STREAM_LIVE_FPS, 1.0)
 
     while not shutdown_event.is_set():
@@ -3237,17 +3025,11 @@ def camera_worker(camera_config, rtsp_url=None):
             _camera_log(
                 camera_id,
                 (
-                    f"Connecting to NVR={camera_config['nvr_ip']} "
-                    f"CHANNEL={camera_config['channel']} "
-                    f"SUBTYPE={camera_config['subtype']}"
+                    f"[FACE-ONLY][CAMERA] connecting "
+                    f"channel={camera_config['channel']} "
+                    f"subtype={camera_config['subtype']}"
                 ),
             )
-            if RTSP_DEBUG:
-                _camera_log(
-                    camera_id,
-                    f"[RTSP OPEN] camera={camera_id} channel={camera_config['channel']} "
-                    f"subtype={camera_config['subtype']} url={redact_rtsp_url(rtsp_url)}",
-                )
             cap = cv2.VideoCapture(
                 rtsp_url,
                 cv2.CAP_FFMPEG,
@@ -3267,7 +3049,10 @@ def camera_worker(camera_config, rtsp_url=None):
                     connected=False,
                     latest_update_at=time.time(),
                 )
-                _camera_log(camera_id, "Could not open MAIN RTSP stream.")
+                _camera_log(
+                    camera_id,
+                    "[FACE-ONLY][CAMERA] stage=connect result=failed",
+                )
                 _release_camera_capture(camera_id)
                 shutdown_event.wait(5)
                 continue
@@ -3279,7 +3064,7 @@ def camera_worker(camera_config, rtsp_url=None):
                 connected=True,
                 latest_update_at=time.time(),
             )
-            _camera_log(camera_id, "RTSP stream connected.")
+            _camera_log(camera_id, "[FACE-ONLY][CAMERA] stage=connect result=ready")
             consecutive_read_failures = 0
 
             while not shutdown_event.is_set():
@@ -3297,13 +3082,14 @@ def camera_worker(camera_config, rtsp_url=None):
                         connected=False,
                         latest_update_at=time.time(),
                     )
-                    _camera_log(camera_id, "Frame read failed repeatedly.")
+                    _camera_log(
+                        camera_id,
+                        "[FACE-ONLY][CAMERA] stage=read result=failed reconnecting=true",
+                    )
                     break
 
 
                 consecutive_read_failures = 0
-                frame_processing_started_at = time.time()
-
                 main_packet = getattr(cap, "last_packet", None)
                 frame_age_ms = (
                     max(0.0, (time.time() - main_packet["capture_timestamp"]) * 1000.0)
@@ -3316,1380 +3102,155 @@ def camera_worker(camera_config, rtsp_url=None):
                 ):
                     _camera_log(
                         camera_id,
-                        f"[VIDEO] stale MAIN frame dropped age_ms={frame_age_ms:.0f}",
+                        "[FACE-ONLY][FRAME] result=dropped reason=stale "
+                        f"age_ms={frame_age_ms:.0f}",
                     )
                     continue
 
-                if RTSP_DEBUG and (time.time() - last_rtsp_debug_time >= 5.0):
-                    small = cv2.resize(frame, (64, 36), interpolation=cv2.INTER_AREA)
-                    frame_hash = hashlib.md5(small.tobytes()).hexdigest()[:8]
-                    _camera_log(
-                        camera_id,
-                        f"[FRAME CHECK] camera={camera_id} channel={camera_config['channel']} "
-                        f"subtype={camera_config['subtype']} hash={frame_hash}",
-                    )
-                    last_rtsp_debug_time = time.time()
-
                 frame_counter += 1
 
-                if (
-                    frame_counter
-                    %
-                    PROCESS_EVERY_N_FRAMES
-                    == 0
-                ):
-
+                if frame_counter % PROCESS_EVERY_N_FRAMES == 0:
+                    face_only_results = []
                     try:
-
-                        person_frame = frame
-                        person_boxes = detect_person_boxes(person_frame)
+                        detected_faces = safe_face_inference(frame)
                         _camera_log(
                             camera_id,
-                            f"[PERSON GATE] camera={camera_id} frame={frame_counter} "
-                            f"person_count={len(person_boxes)}",
+                            f"[FACE-ONLY][DETECT] frame={frame_counter} "
+                            f"faces={len(detected_faces)} provider=CPUExecutionProvider",
                         )
-                        next_person_track_id = _update_person_tracks(
-                            person_tracks,
-                            person_boxes,
-                            time.time(),
-                            next_person_track_id,
-                        )
-
-                        # Pose analysis consumes only authoritative person
-                        # tracks. The pose model never creates a person or
-                        # track, and the existing polygon ROI remains master.
-                        if fall_detector is not None and _should_run_kpi(camera_id, "fall"):
-                            roi_points = get_camera_roi(camera_id)["points"]
-                            roi_polygon = roi_points * np.array(
-                                [frame.shape[1], frame.shape[0]], dtype=np.float32
-                            )
-                            confirmed_falls = fall_detector.process(
-                                frame=frame,
-                                camera_id=camera_id,
-                                person_tracks=person_tracks,
-                                roi_polygon=roi_polygon,
-                                inference=safe_model_inference,
-                                now=time.time(),
-                            )
-                            for fall in confirmed_falls:
-                                if detection_manager is not None:
-                                    detection_manager.publish_immediate(
-                                        {
-                                            "detected_at": time.time(),
-                                            "detection_type": "fall_detected",
-                                            "track_id": fall.track_id,
-                                            "person_name": "Unknown",
-                                            "confidence": fall.confidence,
-                                            "gate_name": gate_name,
-                                            "camera_id": camera_id,
-                                            "camera_name": camera_name,
-                                            "box": fall.box,
-                                            "title": "Fall Detected",
-                                            "message": f"Fall detected at {gate_name}",
-                                        },
-                                        frame,
-                                        notify=True,
-                                    )
-
-                        # PPE receives authoritative person tracks and the
-                        # existing polygon ROI. Only confirmed helmet sessions
-                        # use the established event/FCM/evidence path.
-                        if ppe_detector is not None and _should_run_kpi(camera_id, "helmet"):
-                            roi_points = get_camera_roi(camera_id)["points"]
-                            roi_polygon = roi_points * np.array(
-                                [frame.shape[1], frame.shape[0]], dtype=np.float32
-                            )
-                            last_ppe_detections, confirmed_helmets = ppe_detector.process(
-                                frame=frame,
-                                camera_id=camera_id,
-                                person_tracks=person_tracks,
-                                roi_polygon=roi_polygon,
-                                inference=safe_model_inference,
-                                now=time.time(),
-                            )
-                            for helmet in confirmed_helmets:
-                                if detection_manager is not None:
-                                    detection_manager.publish_immediate(
-                                        {
-                                            "detected_at": time.time(),
-                                            "detection_type": "helmet_detected",
-                                            "track_id": helmet.track_id,
-                                            "person_name": "Unknown",
-                                            "confidence": helmet.confidence,
-                                            "gate_name": gate_name,
-                                            "camera_id": camera_id,
-                                            "camera_name": camera_name,
-                                            "box": helmet.box,
-                                            "title": "Helmet Detected",
-                                            "message": f"Helmet detected on {camera_id}.",
-                                        },
-                                        frame,
-                                        notify=True,
-                                    )
-                                    _camera_log(camera_id, f"[PPE] HELMET ALERT_SENT | track={helmet.track_id} | confidence={helmet.confidence:.2f}")
-
-                        if OBJECT_THEFT_ENABLED and camera_id.upper() in OBJECT_THEFT_CAMERAS and object_theft_detector is not None:
-                            roi_polygon = None
-                            if OBJECT_THEFT_ROI_ENABLED:
-                                roi_points = get_camera_roi(camera_id)["points"]
-                                roi_polygon = roi_points * np.array(
-                                    [frame.shape[1], frame.shape[0]], dtype=np.float32
-                                )
-                            theft_alerts = object_theft_detector.process(
-                                frame=frame,
-                                camera_id=camera_id,
-                                roi_polygon=roi_polygon,
-                                inference=safe_model_inference,
-                                now=time.time(),
-                            )
-                            for theft in theft_alerts:
-                                if detection_manager is not None:
-                                    detection_manager.publish_immediate(
-                                        {
-                                            "detected_at": time.time(),
-                                            "detection_type": "object_theft",
-                                            "track_id": theft.track_id,
-                                            "person_name": theft.canonical_class,
-                                            "confidence": theft.confidence,
-                                            "gate_name": gate_name,
-                                            "camera_id": camera_id,
-                                            "camera_name": camera_name,
-                                            "box": theft.bbox,
-                                            "annotation_box": theft.bbox,
-                                            "mask": theft.mask,
-                                            "object_name": theft.canonical_class,
-                                            "session_id": theft.session_id,
-                                            "title": "Object Theft Detected",
-                                            "message": f"{theft.class_name.title()} theft confirmed at {gate_name}",
-                                        },
-                                        frame,
-                                        notify=True,
-                                    )
-                            _camera_log(camera_id, f"[OBJECT THEFT] processed | alerts={len(theft_alerts)}")
-
-                        # Smoke/fire is camera-local, uses the existing ROI,
-                        # and publishes only temporally-confirmed incidents.
-                        if smoke_fire_detector is not None:
-                            roi_points = get_camera_roi(camera_id)["points"]
-                            roi_polygon = roi_points * np.array(
-                                [frame.shape[1], frame.shape[0]], dtype=np.float32
-                            )
-                            last_smoke_fire_detections, confirmed_incidents = smoke_fire_detector.process(
-                                frame=frame,
-                                camera_id=camera_id,
-                                roi_polygon=roi_polygon,
-                                inference=safe_model_inference,
-                                now=time.time(),
-                            )
-                            for incident in confirmed_incidents:
-                                incident_label = incident.type.title()
-                                _camera_log(
-                                    camera_id,
-                                    "[SMOKE/FIRE] INCIDENT_CONFIRMED "
-                                    f"| id={incident.incident_id} "
-                                    f"| type={incident.type} "
-                                    f"| confidence={incident.confidence:.2f}",
-                                )
-                                if detection_manager is not None and not SMOKE_FIRE_TEST_MODE:
-                                    detection_manager.publish_immediate(
-                                        {
-                                            "detected_at": time.time(),
-                                            "detection_type": f"{incident.type}_detected",
-                                            "incident_id": incident.incident_id,
-                                            "person_name": "Unknown",
-                                            "confidence": incident.confidence,
-                                            "gate_name": gate_name,
-                                            "camera_id": camera_id,
-                                            "camera_name": camera_name,
-                                            "box": incident.box,
-                                            "smoke_present": incident.smoke_present,
-                                            "fire_present": incident.fire_present,
-                                            "title": f"{incident_label} Detected",
-                                            "message": f"{incident_label} detected at {gate_name}",
-                                        },
-                                        frame,
-                                        notify=True,
-                                    )
-                                    _camera_log(
-                                        camera_id,
-                                        f"[SMOKE/FIRE] {incident_label.upper()} ALERT_SENT "
-                                        f"| incident={incident.incident_id}",
-                                    )
-                                elif SMOKE_FIRE_TEST_MODE:
-                                    _camera_log(
-                                        camera_id,
-                                        "[SMOKE/FIRE] test mode: alert not published "
-                                        f"| incident={incident.incident_id}",
-                                    )
-
-                        if (
-                            camera_config.get("kpi") == "vehicle"
-                            and
-                            frame_counter
-                            %
-                            VEHICLE_PROCESS_EVERY_N_FRAMES
-                            == 0
-                        ):
-                            detected_vehicles = detect_vehicle_boxes(frame)
-                            last_vehicles = [
-                                vehicle
-                                for vehicle in detected_vehicles
-                                if vehicle_in_roi(
-                                    vehicle["box"],
-                                    frame.shape[1],
-                                    frame.shape[0],
-                                    camera_id=camera_id,
-                                )
-                            ]
-                        elif camera_config.get("kpi") != "vehicle":
-                            last_vehicles = []
-
-                        vehicle_person_boxes = [
-                            person_box
-                            for person_box in person_boxes
-                            if any(
-                                boxes_overlap(person_box, vehicle["box"])
-                                for vehicle in last_vehicles
-                            )
-                        ]
-
-                        detected_faces = _detect_faces_in_person_crops(
-                            frame,
-                            person_boxes,
-                            person_tracks=person_tracks,
-                            camera_id=camera_id,
-                        )
-
-                        if detected_faces:
-                            _camera_log(
-                                camera_id,
-                                "[FACE] detections="
-                                + ", ".join(
-                                    f"{float(getattr(face, 'det_score', 0.0)):.3f}"
-                                    for face in detected_faces
-                                ),
-                            )
-
-                        now = time.time()
-                        accepted_faces = []
                         for face in detected_faces:
-                            det_score = float(getattr(face, "det_score", 0.0))
-                            face_box = face.bbox.astype(int)
-                            associated_person_box = getattr(face, "person_box", None)
-                            if (
-                                associated_person_box is None
-                                or not face_box_inside_person(
-                                    face_box,
-                                    associated_person_box,
-                                )
-                            ):
+                            detection_score = float(
+                                getattr(face, "det_score", 0.0)
+                            )
+                            face_box = np.asarray(
+                                getattr(face, "bbox", []),
+                                dtype=np.float32,
+                            ).reshape(-1)
+                            if face_box.size != 4 or not is_plausible_face_detection(face):
                                 _camera_log(
                                     camera_id,
-                                    f"[FACE] REJECTED | camera={camera_id} | "
-                                    f"reason=face_outside_person | det_score={det_score:.3f} | "
-                                    f"face_box={tuple(int(value) for value in face_box)}",
+                                    f"[FACE-ONLY][REJECT] reason=invalid_face_geometry "
+                                    f"det_score={detection_score:.3f}",
                                 )
                                 continue
-                            _camera_log(
-                                camera_id,
-                                f"[FACE ASSOCIATION] camera={camera_id} "
-                                f"face_box={tuple(int(value) for value in face_box)} "
-                                f"person_box={tuple(int(value) for value in associated_person_box)} "
-                                "result=PASS",
-                            )
-                            active_track_match = any(
-                                now - remembered_face["last_seen"]
-                                < KNOWN_IDENTITY_MEMORY_TIMEOUT
-                                and _same_face_track(
-                                    face_box,
-                                    remembered_face["box"],
-                                )
-                                for remembered_face in known_face_memory
-                            )
-                            if det_score < FACE_RECOGNITION_MIN_DET_SCORE:
+                            if detection_score < FACE_RECOGNITION_MIN_DET_SCORE:
                                 _camera_log(
                                     camera_id,
-                                    f"[FACE] REJECTED | camera={camera_id} | "
-                                    f"reason=low_detection_confidence | det_score={det_score:.3f}",
-                                )
-                                continue
-                            if not is_plausible_face_detection(face):
-                                _camera_log(
-                                    camera_id,
-                                    f"[FACE] REJECTED | camera={camera_id} | "
-                                    f"reason=invalid_face_geometry | det_score={det_score:.3f}",
+                                    f"[FACE-ONLY][REJECT] reason=low_face_score "
+                                    f"score={detection_score:.3f} "
+                                    f"minimum={FACE_RECOGNITION_MIN_DET_SCORE:.3f}",
                                 )
                                 continue
 
-                            person_track_id = getattr(face, "person_track_id", None)
-                            person_track = next(
-                                (
-                                    track for track in person_tracks
-                                    if track.get("matched_this_frame")
-                                    and person_track_id is not None
-                                    and track["track_id"] == person_track_id
-                                ),
-                                None,
-                            )
-                            if person_track is None:
-                                _camera_log(
-                                    camera_id,
-                                    f"[FACE] REJECTED | camera={camera_id} | "
-                                    f"reason=no_person_association | det_score={det_score:.3f}",
-                                )
-                                continue
-                            if (
-                                not np.array_equal(
-                                    np.asarray(person_track.get("box"), dtype=np.int32),
-                                    np.asarray(associated_person_box, dtype=np.int32),
-                                )
-                                or not _person_track_in_roi(
-                                    person_track,
-                                    frame.shape[1],
-                                    frame.shape[0],
-                                    camera_id=camera_id,
-                                )
-                            ):
-                                _camera_log(
-                                    camera_id,
-                                    f"[FACE REJECT] camera={camera_id} "
-                                    f"track_id={person_track['track_id']} "
-                                    "reason=FACE_OUTSIDE_PERSON_OR_ROI",
-                                )
-                                continue
-
-                            if FACE_ASSOCIATION_DEBUG:
-                                center_x = (face_box[0] + face_box[2]) / 2.0
-                                center_y = (face_box[1] + face_box[3]) / 2.0
-                                face_area = max(
-                                    (face_box[2] - face_box[0]) * (face_box[3] - face_box[1]),
-                                    1e-6,
-                                )
-                                overlap = (
-                                    max(0.0, min(face_box[2], associated_person_box[2]) - max(face_box[0], associated_person_box[0]))
-                                    * max(0.0, min(face_box[3], associated_person_box[3]) - max(face_box[1], associated_person_box[1]))
-                                    / face_area
-                                )
-                                _camera_log(
-                                    camera_id,
-                                    f"[FACE-ASSOCIATION] camera={camera_id} person_track={person_track['track_id']} "
-                                    f"person_box={tuple(int(value) for value in associated_person_box)} "
-                                    f"face_box={tuple(int(value) for value in face_box)} "
-                                    f"face_center=({center_x:.1f},{center_y:.1f}) overlap={overlap:.3f} associated=true",
-                                )
-
-                            track_key = (camera_id, int(person_track["track_id"]))
-                            current_hits = face_confirmation_state.get(track_key, 0)
-                            face_confirmation_state[track_key] = current_hits + 1
-                            if face_confirmation_state[track_key] < 2:
-                                _camera_log(
-                                    camera_id,
-                                    f"[FACE] REJECTED | camera={camera_id} | reason=temporal_confirmation_pending | "
-                                    f"track={person_track['track_id']} | hits={face_confirmation_state[track_key]}",
-                                )
-                                continue
-
-                            associated_with_vehicle = (
-                                associated_person_box is not None
-                                and any(
-                                    np.array_equal(
-                                        associated_person_box,
-                                        vehicle_person_box,
-                                    )
-                                    for vehicle_person_box in vehicle_person_boxes
-                                )
-                            )
-                            face_roi_pass = face_in_roi(
-                                face_box,
-                                frame.shape[1],
-                                frame.shape[0],
-                                camera_id=camera_id,
-                            )
-                            if not face_roi_pass and not associated_with_vehicle:
-                                _camera_log(
-                                    camera_id,
-                                    f"[FACE ROI] camera={camera_id} result=REJECT "
-                                    "reason=outside_roi",
-                                )
-                                continue
-                            face_validation = dict(
-                                getattr(face, "face_validation", {})
-                            )
-                            face_validation.update({
-                                "valid_person": True,
-                                "person_class": 0,
-                                "person_inside_roi": True,
-                                "person_crop_valid": True,
-                                "valid_face": det_score >= FACE_RECOGNITION_MIN_DET_SCORE,
-                                "face_inside_person": True,
-                                "human_face_valid": is_plausible_face_detection(face),
-                                "face_belongs_to_person": True,
-                                "unknown_face_score_valid": (
-                                    det_score >= UNKNOWN_FACE_MIN_SCORE
-                                ),
-                                "source": "YOLO_PERSON_CROP",
-                            })
-                            if not is_validated_human_face(face_validation):
-                                _camera_log(
-                                    camera_id,
-                                    f"[FACE REJECT] camera={camera_id} "
-                                    f"track_id={person_track['track_id']} "
-                                    "reason=INVALID_FACE",
-                                )
-                                continue
-                            face.face_validation = face_validation
-                            person_track["face_validation"] = face_validation.copy()
-                            _camera_log(
-                                camera_id,
-                                f"[FACE ROI] camera={camera_id} result=PASS"
-                                + (" reason=vehicle_context" if associated_with_vehicle and not face_roi_pass else ""),
-                            )
-                            face.associated_person_box = associated_person_box
-                            face.person_associated = associated_person_box is not None
-                            face.vehicle_context = associated_with_vehicle
-                            accepted_faces.append(face)
-
-                        faces_by_person = {}
-                        unassociated_faces = []
-                        for face in accepted_faces:
-                            associated_box = getattr(face, "associated_person_box", None)
-                            if associated_box is None:
-                                unassociated_faces.append(face)
-                                continue
-                            person_key = tuple(int(value) for value in associated_box)
-                            current_best = faces_by_person.get(person_key)
-                            if current_best is None or float(getattr(
-                                face, "det_score", 0.0
-                            )) > float(getattr(current_best, "det_score", 0.0)):
-                                faces_by_person[person_key] = face
-                        last_faces = list(faces_by_person.values())
-                        for face in unassociated_faces:
-                            if not any(
-                                _same_face_track(face.bbox, existing.bbox)
-                                for existing in last_faces
-                            ):
-                                last_faces.append(face)
-                        if len(accepted_faces) != len(last_faces):
-                            _camera_log(
-                                camera_id,
-                                f"[FACE ASSOCIATION] camera={camera_id} "
-                                f"accepted={len(accepted_faces)} "
-                                f"unique_person_faces={len(last_faces)}",
-                            )
-
-                        excluded_face_count = len(detected_faces) - len(last_faces)
-                        if excluded_face_count:
-                            _camera_log(
-                                camera_id,
-                                f"[FACE] {excluded_face_count} detected face(s) excluded "
-                                f"by confidence/ROI (min_det_score={FACE_RECOGNITION_MIN_DET_SCORE:.2f})",
-                            )
-
-                        if not detected_faces and now - last_detection_log_time >= 5.0:
-                            _camera_log(
-                                camera_id,
-                                "[FACE] InsightFace detected no face",
-                            )
-                            last_detection_log_time = now
-
-                        seen_unknown_in_frame = False
-                        unknown_count_in_frame = 0
-
-
-                        # ----------------------------------------
-                        # Remove old remembered faces
-                        # ----------------------------------------
-
-                        active_memory = []
-                        for remembered_face in known_face_memory:
-                            if now - remembered_face["last_seen"] < KNOWN_IDENTITY_MEMORY_TIMEOUT:
-                                active_memory.append(remembered_face)
-                            else:
-                                _camera_log(
-                                    camera_id,
-                                    f"[FACE] IDENTITY_CLEARED | camera={camera_id} | "
-                                    f"name={remembered_face['name']} | reason=track_timeout",
-                                )
-                        known_face_memory[:] = active_memory
-
-                        # ----------------------------------------
-                        # Process faces
-                        # ----------------------------------------
-
-                        for face in last_faces:
-
-                            person_track_id = getattr(face, "person_track_id", None)
-                            person_track = next(
-                                (
-                                    track for track in person_tracks
-                                    if track.get("matched_this_frame")
-                                    and person_track_id is not None
-                                    and track["track_id"] == person_track_id
-                                ),
-                                None,
-                            )
-                            if (
-                                person_track is None
-                                or not _person_track_in_roi(
-                                    person_track,
-                                    frame.shape[1],
-                                    frame.shape[0],
-                                    camera_id=camera_id,
-                                )
-                            ):
-                                continue
-                            if not is_validated_human_face(
-                                getattr(face, "face_validation", None)
-                            ):
-                                continue
-
-                            (
-                                name,
-                                score
-                            ) = recognize_face(
+                            name, recognition_score = recognize_face(
                                 face,
                                 camera_id=camera_id,
                             )
-                            person_track["recognition_decision"] = getattr(
+                            decision = getattr(
                                 face,
                                 "recognition_decision",
                                 "UNKNOWN",
                             )
-
-                            current_box = (
-                                face.bbox.astype(int)
-                            )
-                            face.annotation_box = current_box.copy()
-                            current_body_box = getattr(
-                                face,
-                                "associated_person_box",
-                                None,
-                            )
-                            if current_body_box is None:
-                                continue
-                            face_is_in_roi = face_in_roi(
-                                current_box,
-                                frame.shape[1],
-                                frame.shape[0],
-                                camera_id=camera_id,
-                            )
-
-
-                            candidate_key = getattr(
-                                face,
-                                "recognition_candidate_key",
-                                None,
-                            )
-                            current_strong_match = (
-                                name != "Unknown"
-                                and candidate_key is not None
-                                and score >= RECOGNITION_THRESHOLD
-                            )
-                            retained_memory = None
-                            if not current_strong_match:
-                                for remembered_face in known_face_memory:
-                                    if not _same_face_track(
-                                        current_box,
-                                        remembered_face["box"],
-                                    ):
-                                        continue
-                                    remembered_body_box = remembered_face.get("body_box")
-                                    if (
-                                        current_body_box is not None
-                                        and remembered_body_box is not None
-                                        and not _same_face_track(
-                                            current_body_box,
-                                            remembered_body_box,
-                                        )
-                                    ):
-                                        continue
-                                    retained_memory = remembered_face
-                                    break
-
-                            if current_strong_match:
-                                metadata = known_person_metadata.get(candidate_key, {})
-                                if person_track is not None:
-                                    person_track.update({
-                                        "identity_status": "KNOWN",
-                                        "employee_id": metadata.get("employee_id"),
-                                        "employee_name": name,
-                                        "last_verified_score": score,
-                                        "body_box": (
-                                            current_body_box.copy()
-                                            if current_body_box is not None else None
-                                        ),
-                                        "bbox": (
-                                            current_body_box.copy()
-                                            if current_body_box is not None else person_track.get("bbox")
-                                        ),
-                                        "face_box": current_box.copy(),
-                                        "annotation_box": current_box.copy(),
-                                        "recognition_score": score,
-                                        "unknown_evidence": True,
-                                    })
-                                matching_memory = next(
-                                    (
-                                        remembered_face
-                                        for remembered_face in known_face_memory
-                                        if remembered_face.get("key") == candidate_key
-                                        and _same_face_track(
-                                            current_box,
-                                            remembered_face["box"],
-                                        )
-                                    ),
-                                    None,
-                                )
-                                if matching_memory is None:
-                                    matching_memory = {
-                                        "key": candidate_key,
-                                        "name": name,
-                                        "employee_id": metadata.get("employee_id"),
-                                        "score": score,
-                                        "last_verified_score": score,
-                                        "box": current_box,
-                                        "body_box": current_body_box,
-                                        "last_seen": now,
-                                        "camera_id": camera_id,
-                                        "identity_source": "face_match",
-                                        "confidence_state": "verified",
-                                    }
-                                    known_face_memory.append(matching_memory)
-                                else:
-                                    matching_memory.update({
-                                        "name": name,
-                                        "employee_id": metadata.get("employee_id"),
-                                        "score": score,
-                                        "last_verified_score": score,
-                                        "box": current_box,
-                                        "body_box": current_body_box,
-                                        "last_seen": now,
-                                        "confidence_state": "verified",
-                                    })
-                                _camera_log(
-                                    camera_id,
-                                    f"[FACE] KNOWN | name={name} | "
-                                    f"current_similarity={score:.4f} | source=current_match",
-                                )
-                            elif person_track is not None and person_track.get("identity_status") == "KNOWN":
-                                name = person_track["employee_name"]
-                                face.person_id = person_track.get("employee_id")
-                                person_track.update({
-                                    "body_box": (
-                                        current_body_box.copy()
-                                        if current_body_box is not None
-                                        else person_track.get("body_box")
-                                    ),
-                                    "bbox": (
-                                        current_body_box.copy()
-                                        if current_body_box is not None else person_track.get("bbox")
-                                    ),
-                                    "face_box": current_box.copy(),
-                                    "annotation_box": current_box.copy(),
-                                    "recognition_score": score,
-                                    "unknown_evidence": True,
-                                })
-                                face.recognition_decision = "RETAINED"
-                                _camera_log(
-                                    camera_id,
-                                    f"[IDENTITY] camera={camera_id} "
-                                    f"track={person_track['track_id']} "
-                                    f"current={getattr(face, 'recognition_candidate_name', 'UNKNOWN')} "
-                                    f"established={name} final=KNOWN "
-                                    "reason=retain_active_known_track",
-                                )
-                            elif retained_memory is not None:
-                                name = retained_memory["name"]
-                                face.person_id = retained_memory.get("employee_id")
-                                retained_memory.update({
-                                    "box": current_box,
-                                    "body_box": (
-                                        current_body_box
-                                        if current_body_box is not None
-                                        else retained_memory.get("body_box")
-                                    ),
-                                    "last_seen": now,
-                                    "score": score,
-                                    "confidence_state": "retained",
-                                })
-                                face.recognition_decision = "RETAINED"
-                                _camera_log(
-                                    camera_id,
-                                    f"[FACE] KNOWN_RETAINED | camera={camera_id} | "
-                                    f"name={name} | current_similarity={score:.4f} | "
-                                    f"last_verified={retained_memory['last_verified_score']:.4f} | "
-                                    "source=active_track",
-                                )
-                            elif getattr(face, "recognition_decision", None) == "PENDING":
-                                name = "Pending"
-                                face.person_id = None
-                            else:
-                                name = "Unknown"
-                                face.person_id = None
-
-                            unknown_face_valid = is_validated_unknown_face(
-                                face.face_validation,
-                                getattr(face, "recognition_decision", None),
-                            )
-                            if person_track is not None and name == "Unknown" and unknown_face_valid:
-                                person_track.update({
-                                    "identity_status": "UNKNOWN",
-                                    "body_box": (
-                                        current_body_box.copy()
-                                        if current_body_box is not None else None
-                                    ),
-                                    "bbox": (
-                                        current_body_box.copy()
-                                        if current_body_box is not None else person_track.get("bbox")
-                                    ),
-                                    "face_box": current_box.copy(),
-                                    "annotation_box": current_box.copy(),
-                                    "recognition_score": score,
-                                    "unknown_evidence": True,
-                                })
-
-                            face.recognized_name = name
-                            face.recognition_state = (
+                            identity_state = (
                                 "KNOWN"
-                                if name not in {"Unknown", "Pending"}
-                                else "UNKNOWN"
-                                if (
-                                    name == "Unknown"
-                                    and unknown_face_valid
-                                )
+                                if name != "Unknown"
                                 else "PENDING"
+                                if decision == "PENDING"
+                                else "UNKNOWN"
                             )
-
-                            face.recognition_score = score
-                            face.in_roi = face_is_in_roi
-                            face.unknown_evidence = (
-                                face.recognition_state == "UNKNOWN"
-                                and unknown_face_valid
+                            track, confirmed = face_only_tracker.update(
+                                face_box,
+                                identity_state,
+                                time.time(),
                             )
-
-                            face_detection_score = float(
-                                getattr(face, "det_score", 0.0)
+                            face_results_item = (
+                                face,
+                                name,
+                                recognition_score,
+                                identity_state,
                             )
-                            recognition_decision = getattr(
-                                face, "recognition_decision", None
-                            )
-                            if recognition_decision == "PENDING":
-                                unknown_gate_status = "HELD_AMBIGUOUS_KNOWN_MATCH"
-                            elif name == "Unknown" and not unknown_face_valid:
-                                if face_detection_score < UNKNOWN_FACE_MIN_SCORE:
-                                    unknown_gate_status = "REJECTED_LOW_FACE_SCORE"
-                                else:
-                                    unknown_gate_status = "REJECTED_VALIDATION"
-                            elif name == "Unknown" and unknown_face_valid:
-                                unknown_gate_status = "ACCEPTED"
-                            else:
-                                unknown_gate_status = "KNOWN"
-
-                            if (
-                                person_track.get("unknown_gate_diagnostic")
-                                != unknown_gate_status
-                            ):
-                                person_track["unknown_gate_diagnostic"] = (
-                                    unknown_gate_status
-                                )
-                                if unknown_gate_status != "KNOWN":
-                                    _camera_log(
-                                        camera_id,
-                                        f"[UNKNOWN GATE] track={person_track['track_id']} "
-                                        f"result={unknown_gate_status} "
-                                        f"decision={recognition_decision} "
-                                        f"face_det_score={face_detection_score:.3f}/"
-                                        f"{UNKNOWN_FACE_MIN_SCORE:.3f} "
-                                        f"similarity={score:.3f} "
-                                        f"candidate_threshold="
-                                        f"{RECOGNITION_CANDIDATE_THRESHOLD:.3f} "
-                                        f"known_threshold={RECOGNITION_THRESHOLD:.3f} "
-                                        f"margin_required={RECOGNITION_MARGIN:.3f}",
-                                    )
-
-
-                            if (
-                                name == "Unknown"
-                                and face.recognition_state == "UNKNOWN"
-                                and face_is_in_roi
-                                and face.unknown_evidence
-                                and face_detection_score
-                                >= UNKNOWN_FACE_MIN_SCORE
-                            ):
-                                seen_unknown_in_frame = True
-
-
-                        current_face_track_ids = {
-                            int(face.person_track_id)
-                            for face in last_faces
-                            if getattr(face, "person_track_id", None) is not None
-                        }
-                        roi_person_tracks = [
-                            person_track
-                            for person_box in person_boxes
-                            for person_track in person_tracks
-                            if (
-                                person_track.get("matched_this_frame")
-                                and int(person_track["track_id"]) in current_face_track_ids
-                                and np.array_equal(
-                                    np.asarray(person_track.get("box"), dtype=np.int32),
-                                    np.asarray(person_box, dtype=np.int32),
-                                )
-                            )
-                        ]
-                        last_event_people = []
-                        event_person_track_ids = set()
-                        for person_track in roi_person_tracks:
-                            person_box = np.asarray(
-                                person_track["box"], dtype=np.int32,
-                            )
-
-                            identity_status = person_track.get("identity_status")
-                            if identity_status == "KNOWN":
-                                recognition_state = "KNOWN"
-                                identity_name = person_track.get("employee_name") or "Unknown"
-                            elif (
-                                identity_status == "UNKNOWN"
-                                and person_track.get("unknown_evidence")
-                            ):
-                                recognition_state = "UNKNOWN"
-                                identity_name = "Unknown"
-                            else:
-                                recognition_state = "PENDING"
-                                identity_name = "Pending"
-
-                            annotation_box = person_track.get("annotation_box")
-                            last_event_people.append(
-                                SimpleNamespace(
-                                    bbox=np.asarray(person_box, dtype=np.int32),
-                                    associated_person_box=np.asarray(
-                                        person_box, dtype=np.int32
-                                    ),
-                                    annotation_box=(
-                                        tuple(int(value) for value in annotation_box)
-                                        if annotation_box is not None
-                                        else None
-                                    ),
-                                    recognized_name=identity_name,
-                                    recognition_state=recognition_state,
-                                    recognition_decision=person_track.get(
-                                        "recognition_decision"
-                                    ),
-                                    face_validation=person_track.get(
-                                        "face_validation"
-                                    ),
-                                    recognition_score=float(
-                                        person_track.get("recognition_score", 0.0)
-                                    ),
-                                    person_id=person_track.get("employee_id"),
-                                    track_id=person_track["track_id"],
-                                )
-                            )
-                            event_person_track_ids.add(person_track["track_id"])
-
-                        unique_unknown_people = [
-                            person
-                            for person in last_event_people
-                            if getattr(person, "recognized_name", "Unknown") == "Unknown"
-                        ]
-                        unknown_count_in_frame = len(unique_unknown_people)
-                        seen_unknown_in_frame = bool(unique_unknown_people)
-                        _camera_log(
-                            camera_id,
-                            f"[UNKNOWN COUNT] camera={camera_id} "
-                            f"unique_tracks={unknown_count_in_frame}",
-                        )
-                        unknown_vehicle_person_detected = any(
-                            getattr(face, "recognized_name", "Unknown") == "Unknown"
-                            and any(
-                                face_inside_person(
-                                    face.bbox.astype(int),
-                                    person_box,
-                                )
-                                for person_box in vehicle_person_boxes
-                            )
-                            for face in last_faces
-                        )
-
-                        if now - last_detection_log_time >= 5.0:
-
-                            known_count_in_frame = sum(
-                                1
-                                for face in last_faces
-                                if getattr(
-                                    face,
-                                    "recognized_name",
-                                    "Unknown"
-                                ) != "Unknown"
-                            )
-                            two_wheeler_count = sum(
-                                1
-                                for vehicle in last_vehicles
-                                if vehicle["vehicle_type"] == "two_wheeler"
-                            )
-                            four_wheeler_count = sum(
-                                1
-                                for vehicle in last_vehicles
-                                if vehicle["vehicle_type"] == "four_wheeler"
-                            )
-
-                            if (
-                                known_count_in_frame
-                                or unknown_count_in_frame
-                                or two_wheeler_count
-                                or four_wheeler_count
-                            ):
-                                _save_detection_event(
-                                    known_count_in_frame,
-                                    unknown_count_in_frame,
-                                    two_wheeler_count,
-                                    four_wheeler_count,
-                                    now
-                                )
-
-                            vehicle_labels = ", ".join(
-                                f"{vehicle['vehicle_type']}"
-                                f" ({vehicle['class_name']}, "
-                                f"{vehicle['confidence']:.2f})"
-                                for vehicle in last_vehicles
-                            ) or "none"
-
+                            face_only_results.append(face_results_item)
                             _camera_log(
                                 camera_id,
-                                f"Faces detected: {len(detected_faces)}, "
-                                f"persons: {len(person_boxes)}, "
-                                f"inside ROI: {len(last_faces)}, "
-                                f"known: {known_count_in_frame}, "
-                                f"unknown: {unknown_count_in_frame}, "
-                                f"two_wheeler: {two_wheeler_count}, "
-                                f"four_wheeler: {four_wheeler_count}, "
-                                f"vehicles: {vehicle_labels}",
+                                f"[FACE-ONLY][IDENTITY] track={track['track_id']} "
+                                f"state={identity_state} name={name} "
+                                f"recognition_score={recognition_score:.4f} "
+                                f"face_score={detection_score:.3f} "
+                                f"confirmations={track['hits']}/2",
                             )
 
-                            for vehicle in last_vehicles:
+                            if identity_state != "UNKNOWN":
+                                continue
+                            if detection_score < UNKNOWN_FACE_MIN_SCORE:
                                 _camera_log(
                                     camera_id,
-                                    f"Vehicle detected: {vehicle['vehicle_type']} "
-                                    f"({vehicle['class_name']}), confidence: "
-                                    f"{vehicle['confidence']:.2f}",
+                                    f"[FACE-ONLY][EMAIL] track={track['track_id']} "
+                                    f"stage=validation result=blocked "
+                                    f"reason=face_score_below_minimum "
+                                    f"score={detection_score:.3f} "
+                                    f"minimum={UNKNOWN_FACE_MIN_SCORE:.3f}",
                                 )
+                                continue
+                            now = time.time()
+                            if (
+                                not confirmed
+                                or track["email_attempted"]
+                                or now - track["last_email_attempt_at"] < 5.0
+                            ):
+                                continue
 
-                            last_detection_log_time = now
-
-
-                        # ----------------------------------------
-                        # Unknown person presence
-                        # ----------------------------------------
-
-                        if seen_unknown_in_frame:
-
-                            if not unknown_present:
-
-                                unknown_present = True
-
-                                unknown_first_seen = now
-
-                            unknown_frame_history.append(
-                                annotate_alert_frame(
-                                    frame,
-                                    last_faces,
-                                )
+                            track["last_email_attempt_at"] = now
+                            alert_frame = _annotate_face_only_frame(
+                                frame,
+                                [face_results_item],
                             )
-                            max_unknown_count = max(
-                                max_unknown_count,
-                                unknown_count_in_frame,
+                            queued = _send_face_only_unknown_email(
+                                camera_id,
+                                camera_name,
+                                face,
+                                recognition_score,
+                                alert_frame,
                             )
-
-                            if unknown_present:
-
-                                unknown_last_seen = now
-
-                                if (
-                                    not unknown_alert_sent
-                                    and (
-                                        unknown_vehicle_person_detected
-                                        or now - unknown_first_seen
-                                        >= MIN_UNKNOWN_PRESENCE
-                                    )
-                                ):
-
-                                    if (
-                                        now - last_alert_time
-                                        >= ALERT_DEDUP_TIME
-                                    ):
-
-                                        _camera_log(camera_id, "Unknown person detected in ROI.")
-
-                                        camera_status = "Unknown person detected"
-                                        _set_camera_state(
-                                            camera_id,
-                                            status=camera_status,
-                                            latest_update_at=time.time(),
-                                        )
-
-                                        _camera_log(camera_id, "Unknown event will be saved by the detection manager.")
-
-                                        last_alert_time = now
-
-                                    else:
-
-                                        _camera_log(
-                                            camera_id,
-                                            "Alert suppressed "
-                                            f"(duplicate within {ALERT_DEDUP_TIME}s window)",
-                                        )
-
-                                    unknown_alert_sent = True
-
-
-                        # ----------------------------------------
-                        # Person left frame
-                        # ----------------------------------------
-
-                        elif (
-                            unknown_present
-                            and
-                            now
-                            -
-                            unknown_last_seen
-                            >=
-                            UNKNOWN_GONE_CLEARANCE
-                        ):
-
-                            unknown_present = False
-
-                            unknown_first_seen = 0.0
-
-                            unknown_last_seen = 0.0
-
-                            unknown_frame_history.clear()
-
-                            max_unknown_count = 0
-
-                            unknown_alert_sent = False
-
-
-                    except Exception as e:
-
-                        _camera_log(camera_id, f"[ERROR] Face processing error: {e}")
-
-
-                height, width = frame.shape[:2]
-                # ------------------------------------------------
-                # ANNOTATED FRAME
-                # ------------------------------------------------
+                            track["email_attempted"] = (
+                                queued or email_alert_queue is None
+                            )
+                    except Exception as error:
+                        _camera_log(
+                            camera_id,
+                            f"[FACE-ONLY][ERROR] stage=inference_or_email "
+                            f"error_type={type(error).__name__} error={error}",
+                        )
 
                 now = time.time()
-
-
-                if (
-                    now
-                    -
-                    last_emit_time
-                    >=
-                    emit_interval
-                ):
-
-                    last_emit_time = now
-
-                    send_frame = frame.copy()
-
-                    if ppe_detector is not None and PPE_ANNOTATION_ENABLED and _should_run_kpi(camera_id, "helmet"):
-                        ppe_detector.annotate(send_frame, last_ppe_detections)
-
-                    if smoke_fire_detector is not None:
-                        smoke_fire_detector.annotate(send_frame, last_smoke_fire_detections)
-
-                    for face in last_faces:
-
-                        if (
-                            getattr(face, "recognized_name", "Unknown") == "Unknown"
-                            and not getattr(face, "unknown_evidence", False)
-                        ):
-                            continue
-
-                        x1, y1, x2, y2 = (
-                            face.bbox.astype(int)
-                        )
-
-                        name = getattr(
-                            face,
-                            "recognized_name",
-                            "Unknown"
-                        )
-
-                        score = float(
-                            getattr(
-                                face,
-                                "recognition_score",
-                                0.0
-                            )
-                        )
-
-
-                        x1 = max(
-                            0,
-                            min(
-                                x1,
-                                width - 1
-                            )
-                        )
-
-                        y1 = max(
-                            0,
-                            min(
-                                y1,
-                                height - 1
-                            )
-                        )
-
-                        x2 = max(
-                            0,
-                            min(
-                                x2,
-                                width - 1
-                            )
-                        )
-
-                        y2 = max(
-                            0,
-                            min(
-                                y2,
-                                height - 1
-                            )
-                        )
-
-
-                        if name == "Unknown":
-
-                            color = (
-                                0,
-                                0,
-                                255
-                            )
-
-                            label = "Unknown"
-
-                        else:
-
-                            color = (
-                                0,
-                                255,
-                                0
-                            )
-
-                            label = (
-                                f"{name} "
-                                f"{score:.2f}"
-                            )
-
-
-                        cv2.rectangle(
-                            send_frame,
-                            (x1, y1),
-                            (x2, y2),
-                            color,
-                            2
-                        )
-
-
-                        (
-                            text_width,
-                            text_height
-                        ), baseline = cv2.getTextSize(
-                            label,
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.65,
-                            2
-                        )
-
-
-                        label_y1 = max(
-                            0,
-                            y1
-                            -
-                            text_height
-                            -
-                            baseline
-                            -
-                            8
-                        )
-
-
-                        label_y2 = max(
-                            text_height
-                            +
-                            baseline
-                            +
-                            8,
-                            y1
-                        )
-
-
-                        cv2.rectangle(
-                            send_frame,
-                            (x1, label_y1),
-                            (
-                                x1
-                                +
-                                text_width
-                                +
-                                10,
-                                label_y2
-                            ),
-                            color,
-                            -1
-                        )
-
-
-                        cv2.putText(
-                            send_frame,
-                            label,
-                            (
-                                x1 + 5,
-                                label_y2 - 6
-                            ),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.65,
-                            (
-                                255,
-                                255,
-                                255
-                            ),
-                            2,
-                            cv2.LINE_AA
-                        )
-
-
-                    for vehicle in last_vehicles:
-                        x1, y1, x2, y2 = vehicle["box"]
-                        x1 = max(0, min(int(x1), width - 1))
-                        y1 = max(0, min(int(y1), height - 1))
-                        x2 = max(0, min(int(x2), width - 1))
-                        y2 = max(0, min(int(y2), height - 1))
-                        label = (
-                            f"Vehicle detected: "
-                            f"{vehicle['vehicle_type']} "
-                            f"{vehicle['confidence']:.2f}"
-                        )
-                        color = (
-                            (255, 165, 0)
-                            if vehicle["vehicle_type"] == "two_wheeler"
-                            else (255, 0, 0)
-                        )
-
-                        cv2.rectangle(
-                            send_frame,
-                            (x1, y1),
-                            (x2, y2),
-                            color,
-                            2
-                        )
-                        cv2.putText(
-                            send_frame,
-                            label,
-                            (x1 + 5, max(20, y1 - 8)),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.65,
-                            color,
-                            2,
-                            cv2.LINE_AA
-                        )
-
-
-                    if detection_manager is not None:
-                        # The tracker retains frames until a detection exits the
-                        # ROI, then draws that detection once on the selected
-                        # frame.  Supplying send_frame here would retain the
-                        # preview overlays as well, so the final draw produced
-                        # stale/misplaced annotations and a second vehicle box.
-                        detection_manager.process_frame(
-                            frame=frame,
-                            faces=last_event_people,
-                            vehicles=last_vehicles,
-                            gate_name=gate_name,
-                            detected_at=now,
-                            alert_frame=frame,
-                        )
-
-
-                    # --------------------------------------------
-                    # Resize
-                    # --------------------------------------------
-
-                    if width > STREAM_MAX_WIDTH:
-
-                        scale = (
-                            STREAM_MAX_WIDTH
-                            /
-                            float(width)
-                        )
-
-                        send_frame = cv2.resize(
-                            send_frame,
-                            (
-                                STREAM_MAX_WIDTH,
-                                int(
-                                    height * scale
-                                )
-                            )
-                        )
-
-
-                    # --------------------------------------------
-                    # JPEG encode
-                    # --------------------------------------------
-
-                    jpeg_started_at = time.time()
+                if now - last_emit_time >= emit_interval:
+                    send_frame = _annotate_face_only_frame(frame, face_only_results)
                     success, encoded = cv2.imencode(
                         ".jpg",
                         send_frame,
-                        [
-                            cv2.IMWRITE_JPEG_QUALITY,
-                            STREAM_JPEG_QUALITY
-                        ]
+                        [cv2.IMWRITE_JPEG_QUALITY, STREAM_JPEG_QUALITY],
                     )
-
-
-                    if success:
-
-                        encoded_bytes = (
-                            encoded.tobytes()
+                    if not success:
+                        _camera_log(
+                            camera_id,
+                            "[FACE-ONLY][ERROR] stage=dashboard_frame_encode result=failed",
                         )
+                        continue
 
-                        if now - last_frame_diagnostic_time >= 5.0:
-                            _camera_log(
-                                camera_id,
-                                f"Frame generated: {width}x{height}, "
-                                f"jpeg={len(encoded_bytes) // 1024}KB, "
-                                f"base64={((len(encoded_bytes) + 2) // 3) * 4} chars",
-                            )
-                            last_frame_diagnostic_time = now
+                    encoded_bytes = encoded.tobytes()
+                    last_emit_time = now
+                    if state is not None:
+                        with state["lock"]:
+                            state["latest_annotated_frame"] = encoded_bytes
+                            state["latest_frame_timestamp"] = now
+                            state["status"] = camera_status
+                            state["frame_counter"] = frame_counter
+                            state["processing"] = True
+                            state["connected"] = True
+                    with latest_frame_lock:
+                        latest_annotated_frames[camera_id] = encoded_bytes
+                    continue
 
-
-                        if state is not None:
-                            with state["lock"]:
-                                state["latest_annotated_frame"] = encoded_bytes
-                                state["latest_frame_timestamp"] = now
-                                state["status"] = camera_status
-                                state["frame_counter"] = frame_counter
-                                state["processing"] = True
-                                state["connected"] = True
-
-                        with latest_frame_lock:
-                            latest_annotated_frame = encoded_bytes
-                            latest_annotated_frames[camera_id] = encoded_bytes
-
-
-                        if VIDEO_LATENCY_DEBUG and now - last_latency_diagnostic_time >= 5.0:
-                            _camera_log(
-                                camera_id,
-                                "[VIDEO-LATENCY] "
-                                f"stream=MAIN frame_id={main_packet['frame_id'] if main_packet else frame_counter} "
-                                f"ai_ms={(jpeg_started_at - frame_processing_started_at) * 1000.0:.1f} "
-                                f"jpeg_ms={(time.time() - jpeg_started_at) * 1000.0:.1f}",
-                            )
-                            last_latency_diagnostic_time = now
-
+                continue
 
             if cap is not None:
                 _release_camera_capture(camera_id)
@@ -4707,7 +3268,12 @@ def camera_worker(camera_config, rtsp_url=None):
                 latest_update_at=time.time(),
             )
 
-            _camera_log(camera_id, f"[ERROR] Camera worker: {e}")
+            _camera_log(
+                camera_id,
+                "[FACE-ONLY][CAMERA] stage=worker result=failed "
+                f"error_type={type(e).__name__} "
+                f"detail={_safe_camera_status_message(e)}",
+            )
 
             if cap is not None:
                 _release_camera_capture(camera_id)
@@ -6136,13 +4702,31 @@ def test_notification():
         ), 503
 
 
-    queued = push_alert(
-        "New person detected "
-        f"on {default_camera['name']}",
-        frame,
-        default_camera["name"],
-        camera_id=default_camera["camera_id"],
-        camera_name=default_camera["name"],
+    try:
+        notification_id, image_url = save_alert_image(frame)
+    except Exception as error:
+        print(
+            "[FACE-ONLY][EMAIL] stage=test_evidence result=failed "
+            f"error_type={type(error).__name__}"
+        )
+        return jsonify({
+            "success": False,
+            "error": "Test evidence image could not be saved.",
+        }), 500
+
+    attachment_path = ALERT_IMAGE_DIR / Path(urlsplit(image_url).path).name
+    queued = _queue_email_alert(
+        {
+            "id": notification_id,
+            "title": "Email Delivery Test",
+            "message": f"Manual email delivery test for {default_camera['name']}",
+            "detection_type": "email_test",
+            "camera_id": default_camera["camera_id"],
+            "camera_name": default_camera["name"],
+            "detected_at": time.time(),
+            "image_url": image_url,
+        },
+        attachment_path=attachment_path,
     )
 
     if not queued:
@@ -6256,6 +4840,10 @@ def main():
         f"min_face_score={FACE_RECOGNITION_MIN_DET_SCORE:.2f} "
         f"unknown_face_score={UNKNOWN_FACE_MIN_SCORE:.2f}"
     )
+    print(
+        "[FACE-ONLY] enabled=true models=buffalo_s_detection+ArcFace_recognition "
+        "other_model_inference=disabled alerts=email_only"
+    )
 
 
     # ----------------------------------------
@@ -6266,11 +4854,6 @@ def main():
         configure_h264_stream(camera_config)
 
     initialize_face_model()
-    initialize_fall_detector()
-    initialize_ppe_detector()
-    initialize_smoke_fire_detector()
-    initialize_object_theft_detector()
-    initialize_detection_events()
 
 
     # ----------------------------------------
@@ -6324,11 +4907,8 @@ def main():
     )
 
     print("[INFO] Dashboard: /dashboard")
-    print("[INFO] Detection alert delivery: configured email recipients")
-
-    print(
-        "[INFO] Socket.IO events: "
-        "'face_alert', 'detection_event' (no video frames)"
+    print(    "[FACE-ONLY][EMAIL] configured="
+    + str(email_alert_queue is not None).lower()
     )
 
     print(

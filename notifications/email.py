@@ -143,11 +143,15 @@ class EmailAlertQueue:
             daemon=True,
         )
         self._thread.start()
-        print("[INFO] Email alert worker started")
+        print("[EMAIL][WORKER] stage=start result=ready")
 
     def submit(self, event, attachment_path=None):
         if self._thread is None or not self._thread.is_alive() or self._stopping.is_set():
-            print("[ERROR] Email alert not queued: email worker is not running")
+            print(
+                "[EMAIL][QUEUE] result=failed "
+                f"event_id={event.get('id', 'unknown')} "
+                "reason=worker_not_running"
+            )
             return False
         job = {
             "event": dict(event),
@@ -162,11 +166,15 @@ class EmailAlertQueue:
             self._queue.put_nowait(job)
         except queue.Full:
             print(
-                "[ERROR] Email alert queue full; "
-                f"event_id={event.get('id', 'unknown')} was not queued"
+                "[EMAIL][QUEUE] result=failed "
+                f"event_id={event.get('id', 'unknown')} reason=queue_full"
             )
             return False
-        print(f"[INFO] Email alert queued; event_id={event.get('id', 'unknown')}")
+        print(
+            "[EMAIL][QUEUE] result=accepted "
+            f"event_id={event.get('id', 'unknown')} "
+            f"recipients={len(job['pending_recipients'])}"
+        )
         return True
 
     def stop(self, timeout=20):
@@ -175,9 +183,9 @@ class EmailAlertQueue:
         self._stopping.set()
         self._thread.join(timeout=max(0.0, float(timeout)))
         if self._thread.is_alive():
-            print("[WARNING] Email worker did not stop before timeout")
+            print("[EMAIL][WORKER] stage=stop result=timeout")
         else:
-            print("[INFO] Email alert worker stopped")
+            print("[EMAIL][WORKER] stage=stop result=complete")
 
     def _run(self):
         while True:
@@ -193,19 +201,47 @@ class EmailAlertQueue:
             finally:
                 self._queue.task_done()
 
+    def _safe_error_detail(self, error):
+        detail = str(error)
+        for sensitive_value in (
+            self.config.username,
+            self.config.password,
+        ):
+            if sensitive_value:
+                detail = detail.replace(sensitive_value, "[redacted]")
+        return detail.replace("\r", " ").replace("\n", " ")[:240]
+
     def _deliver_with_retries(self, job):
         event = job["event"]
         event_id = event.get("id", "unknown")
         for attempt in range(1, self.max_attempts + 1):
             try:
+                transport = (
+                    "ssl"
+                    if self.config.use_ssl
+                    else "starttls"
+                    if self.config.use_tls
+                    else "plain"
+                )
+                print(
+                    "[EMAIL][DELIVERY] stage=attempt "
+                    f"event_id={event_id} attempt={attempt}/{self.max_attempts} "
+                    f"host={self.config.host} port={self.config.port} "
+                    f"transport={transport} "
+                    f"recipients={len(job['pending_recipients'])}"
+                )
                 self._send(job)
-                print(f"[INFO] Email alert sent; event_id={event_id}")
+                print(
+                    f"[EMAIL][DELIVERY] stage=complete result=sent "
+                    f"event_id={event_id}"
+                )
                 return
             except Exception as error:
                 print(
-                    "[ERROR] Email alert delivery failed; "
+                    "[EMAIL][DELIVERY] stage=complete result=failed "
                     f"event_id={event_id} attempt={attempt}/{self.max_attempts} "
-                    f"error_type={type(error).__name__}"
+                    f"error_type={type(error).__name__} "
+                    f"detail={self._safe_error_detail(error)}"
                 )
                 if attempt < self.max_attempts:
                     time.sleep(min(2 ** (attempt - 1), 4))
@@ -264,14 +300,23 @@ class EmailAlertQueue:
                     )
                 except (OSError, smtplib.SMTPException) as error:
                     print(
-                        "[WARNING] Email recipient delivery failed; "
+                        "[EMAIL][RECIPIENT] result=failed "
                         f"event_id={event.get('id', 'unknown')} "
-                        f"error_type={type(error).__name__}"
+                        f"error_type={type(error).__name__} "
+                        f"detail={self._safe_error_detail(error)}"
                     )
                     failed_recipients.append(recipient)
                     continue
                 if refused:
+                    status = refused.get(recipient, (None, b""))[0]
+                    response = refused.get(recipient, (None, b""))[1]
                     failed_recipients.append(recipient)
+                    print(
+                        "[EMAIL][RECIPIENT] result=refused "
+                        f"event_id={event.get('id', 'unknown')} "
+                        f"smtp_status={status} "
+                        f"detail={self._safe_error_detail(Exception(response))}"
+                    )
 
         job["pending_recipients"] = failed_recipients
         if failed_recipients:
