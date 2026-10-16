@@ -644,10 +644,10 @@ def initialize_face_model():
     recognition_model_file = Path(
         getattr(recognition_model, "model_file", "")
     ).name.lower()
-    if recognition_model_file != "w600k_r50.onnx":
+    if recognition_model_file != "w600k_mbf.onnx":
         raise RuntimeError(
             "The buffalo_s model pack must provide its ArcFace "
-            "w600k_r50.onnx recognition model; got "
+            "w600k_mbf.onnx recognition model; got "
             f"{recognition_model_file or 'no recognition model'}."
         )
 
@@ -659,7 +659,7 @@ def initialize_face_model():
     print(
         "[FACE MODEL] recognition=ArcFace "
         f"model={recognition_model_file} "
-        f"camera_scope=all_enabled_cameras"
+        "camera_scope=all_enabled_cameras"
     )
 
     print(

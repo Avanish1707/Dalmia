@@ -433,8 +433,8 @@ class DetectionEventManager:
             if event["detection_type"] == "unknown_person":
                 queued = bool(response)
                 print(
-                    f"{self._camera_prefix()} [UNKNOWN] ALERT_SENT "
-                    f"| channel=email queued={queued}"
+                    f"{self._camera_prefix()} [UNKNOWN] EMAIL_QUEUE_RESULT "
+                    f"| queued={queued}"
                 )
             return response
         print("[WARNING] No email sender configured; alert email not queued.")
@@ -581,7 +581,7 @@ class DetectionEventManager:
             print(
                 f"{self._camera_prefix()} [FACE EVENT] "
                 f"track={track['track_id'] or track['event_id']} "
-                "UNKNOWN_ALERT_SENT"
+                "UNKNOWN_ALERT_PUBLISHED"
             )
         return published
 
