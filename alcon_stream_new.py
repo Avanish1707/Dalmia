@@ -632,12 +632,12 @@ def initialize_face_model():
     providers = get_onnx_providers()
 
     print(
-        "[INFO] Loading InsightFace buffalo_l..."
+        "[INFO] Loading InsightFace buffalo_s..."
     )
-    print(f"[FACE MODEL] model=buffalo_l provider={providers}")
+    print(f"[FACE MODEL] model=buffalo_s provider={providers}")
 
     face_app = FaceAnalysis(
-        name="buffalo_l",
+        name="buffalo_s",
         providers=providers
     )
     recognition_model = face_app.models.get("recognition")
@@ -646,7 +646,7 @@ def initialize_face_model():
     ).name.lower()
     if recognition_model_file != "w600k_r50.onnx":
         raise RuntimeError(
-            "The buffalo_l model pack must provide its ArcFace "
+            "The buffalo_s model pack must provide its ArcFace "
             "w600k_r50.onnx recognition model; got "
             f"{recognition_model_file or 'no recognition model'}."
         )
@@ -670,7 +670,7 @@ def initialize_face_model():
 
     print("[OK] Face model loaded.")
     print(
-        "[FACE MODEL] pack=buffalo_l "
+        "[FACE MODEL] pack=buffalo_s "
         f"recognition=ArcFace({recognition_model_file})"
     )
 
@@ -2314,7 +2314,7 @@ def _face_detection_summary(faces):
 
 
 def _registration_image_diagnostics(raw, image, orientation):
-    """Log source and decoded image properties before Buffalo_L inference."""
+    """Log source and decoded image properties before Buffalo_s inference."""
     original_size = None
     original_mode = None
     try:
