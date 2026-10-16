@@ -299,7 +299,10 @@ Follow `[FACE-ONLY][DETECT]`, `[FACE-ONLY][REJECT]`,
 `[FACE-ONLY][IDENTITY]`, and `[FACE-ONLY][EMAIL]` logs to find the exact
 decision stage for each camera.
 
-Unknown-person email is queued after two matching unknown-face detections.
+Unknown-person email is queued on the first detected unknown face that passes
+the configured face-score threshold. A track is emailed at most once while it
+remains present; eligibility, evidence creation, queueing, and SMTP delivery
+are logged separately.
 Configure
 `MAIL_HOST`, `MAIL_PORT`, `MAIL_FROM`, `ALERT_EMAIL_TO`, and the required
 transport/authentication values in the deployment environment. Startup logs

@@ -317,6 +317,7 @@ known_embeddings = {}
 known_person_metadata = {}
 # Full per-person embedding templates used by live recognition.
 known_face_templates = {}
+known_faces_cache_loaded = False
 face_confirmation_state = {}
 face_app = None
 person_detector = None
@@ -1702,7 +1703,9 @@ def load_known_faces():
     global known_embeddings
     global known_person_metadata
     global known_face_templates
+    global known_faces_cache_loaded
 
+    known_faces_cache_loaded = False
     KNOWN_FACES_DIR.mkdir(
         parents=True,
         exist_ok=True
@@ -1772,11 +1775,12 @@ def load_known_faces():
         f"[INFO] Loaded {person_count} registered person(s) with "
         f"{total_templates} individual face templates."
     )
+    known_faces_cache_loaded = True
 
 
 def refresh_known_faces_cache(force=False):
     """Reload the live recognition cache from the persisted registration DB."""
-    if force or not known_face_templates:
+    if force or not known_faces_cache_loaded:
         print("[KNOWN CACHE] Reloading registered faces...")
         try:
             load_known_faces()
@@ -2212,7 +2216,11 @@ def recognize_face(face, camera_id=None):
         refresh_known_faces_cache()
 
     if not known_face_templates:
-        print(f"[FACE] UNKNOWN | best_score=0.00 | best_person=None | threshold={RECOGNITION_THRESHOLD:.2f}")
+        print(
+            "[FACE] UNKNOWN | reason=no_registered_face_templates "
+            f"| best_score=0.00 | best_person=None "
+            f"| threshold={RECOGNITION_THRESHOLD:.2f}"
+        )
         face.person_id = None
         return "Unknown", 0.0
 
@@ -2998,7 +3006,7 @@ def camera_worker(camera_config, rtsp_url=None):
     frame_counter = 0
     camera_status = "Starting..."
     face_only_tracker = FaceOnlyUnknownTracker(
-        confirm_frames=2,
+        confirm_frames=1,
         track_timeout=UNKNOWN_GONE_CLEARANCE,
     )
     face_only_results = []
@@ -3170,7 +3178,8 @@ def camera_worker(camera_config, rtsp_url=None):
                                 f"state={identity_state} name={name} "
                                 f"recognition_score={recognition_score:.4f} "
                                 f"face_score={detection_score:.3f} "
-                                f"confirmations={track['hits']}/2",
+                                f"confirmations={track['hits']}/"
+                                f"{face_only_tracker.confirm_frames}",
                             )
 
                             if identity_state != "UNKNOWN":
@@ -3186,14 +3195,27 @@ def camera_worker(camera_config, rtsp_url=None):
                                 )
                                 continue
                             now = time.time()
+                            if not confirmed:
+                                _camera_log(
+                                    camera_id,
+                                    f"[FACE-ONLY][EMAIL] track={track['track_id']} "
+                                    f"stage=eligibility result=blocked "
+                                    f"reason=confirmation_required hits={track['hits']}",
+                                )
+                                continue
                             if (
-                                not confirmed
-                                or track["email_attempted"]
+                                track["email_attempted"]
                                 or now - track["last_email_attempt_at"] < 5.0
                             ):
                                 continue
 
                             track["last_email_attempt_at"] = now
+                            _camera_log(
+                                camera_id,
+                                f"[FACE-ONLY][EMAIL] track={track['track_id']} "
+                                "stage=eligibility result=eligible "
+                                f"score={detection_score:.3f}",
+                            )
                             alert_frame = _annotate_face_only_frame(
                                 frame,
                                 [face_results_item],

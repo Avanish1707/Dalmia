@@ -47,6 +47,16 @@ def test_unknown_face_requires_two_matching_detections():
     assert second["hits"] == 2
 
 
+def test_unknown_face_can_be_confirmed_on_first_detection():
+    tracker = FaceOnlyUnknownTracker(confirm_frames=1, track_timeout=5)
+    box = np.array([10, 10, 50, 50])
+
+    track, confirmed = tracker.update(box, "UNKNOWN", 1.0)
+
+    assert confirmed is True
+    assert track["hits"] == 1
+
+
 def test_face_tracker_resets_confirmation_when_identity_changes():
     tracker = FaceOnlyUnknownTracker(confirm_frames=2, track_timeout=5)
     box = np.array([10, 10, 50, 50])
