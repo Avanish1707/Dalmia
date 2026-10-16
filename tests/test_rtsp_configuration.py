@@ -75,6 +75,15 @@ def test_camera_loader_strips_credentials_from_configured_endpoint(tmp_path):
     assert endpoint.password is None
 
 
+def test_cam001_uses_known_unknown_kpi():
+    camera = next(
+        camera for camera in load_cameras()
+        if camera["camera_id"] == "CAM001"
+    )
+
+    assert camera["kpi"] == "known_unknown"
+
+
 def test_rtsp_log_redaction_removes_credentials_and_query():
     redacted = rtsp_url.redact_rtsp_url(
         "rtsp://admin:secret@192.168.191.40:554/Streaming/Channels/101"

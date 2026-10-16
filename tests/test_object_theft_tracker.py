@@ -1,4 +1,13 @@
+from object_theft.detector import ObjectTheftDetector
 from object_theft.tracker import ObjectTheftTracker
+
+
+def test_object_theft_detector_is_pinned_to_cpu(monkeypatch):
+    monkeypatch.setattr("object_theft.detector.OBJECT_THEFT_ENABLED", False)
+
+    detector = ObjectTheftDetector()
+
+    assert detector.device == "cpu"
 
 
 def _track(box, confidence=0.9):

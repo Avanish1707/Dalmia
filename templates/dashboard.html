@@ -66,7 +66,8 @@
         const names = document.createElement("div");
         const name = document.createElement("h2");
         const id = document.createElement("small");
-        names.append(name, id);
+        const kpi = document.createElement("small");
+        names.append(name, id, kpi);
         const status = document.createElement("span");
         status.className = "status";
         const dot = document.createElement("i");
@@ -90,7 +91,7 @@
         const detail = document.createElement("p");
         detail.className = "status-message";
         card.append(heading, image, detail);
-        card._nodes = { name, id, status, statusText, detail };
+        card._nodes = { name, id, kpi, status, statusText, detail };
         cards.set(camera.camera_id, card);
         grid.append(card);
       }
@@ -98,6 +99,10 @@
       card.className = `camera ${status}`;
       card._nodes.name.textContent = camera.name || camera.camera_id;
       card._nodes.id.textContent = camera.camera_id;
+      const kpiLabel = camera.kpi === "known_unknown"
+        ? "Known / unknown"
+        : camera.kpi || "Person";
+      card._nodes.kpi.textContent = ` · ${kpiLabel}`;
       card._nodes.statusText.textContent = status.charAt(0).toUpperCase() + status.slice(1);
       card._nodes.detail.textContent = camera.status_message || "";
     }

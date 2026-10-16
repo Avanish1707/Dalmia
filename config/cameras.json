@@ -4,7 +4,7 @@
     "name": "office",
     "ip": "192.168.1.101",
     "nvr_ip": "192.168.191.40",
-    "kpi": "vehicle",
+    "kpi": "known_unknown",
     "enabled": true,
     "channel": 1,
     "subtype": 1,

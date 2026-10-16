@@ -7,7 +7,6 @@ import time
 from dataclasses import dataclass
 
 import numpy as np
-import torch
 
 from .config import (
     OBJECT_THEFT_CONFIDENCE_THRESHOLD,
@@ -49,7 +48,7 @@ class ObjectTheftDetector:
         self.model_loader = model_loader
         self.confidence = float(confidence)
         self.iou = float(iou)
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = "cpu"
         self.model = None
         self.model_names = {}
         self.allowed_class_ids = set()

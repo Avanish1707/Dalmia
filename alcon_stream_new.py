@@ -35,7 +35,6 @@ from firebase_admin import credentials, messaging
 
 import cv2
 import numpy as np
-import onnxruntime as ort
 from PIL import Image, ImageOps
 
 try:
@@ -199,11 +198,9 @@ PERSON_CONFIDENCE = float(os.getenv("PERSON_CONFIDENCE", "0.45"))
 PERSON_IOU = float(os.getenv("PERSON_IOU", "0.45"))
 PERSON_DEDUP_IOU = float(os.getenv("PERSON_DEDUP_IOU", "0.50"))
 
-USE_GPU = os.getenv("USE_GPU", "auto").strip().lower()
-CUDA_DEVICE_ID = int(os.getenv("CUDA_DEVICE_ID", "0"))
+INFERENCE_DEVICE = "cpu"
 VEHICLE_MODEL_PATH = "yolo26l.pt"
 VEHICLE_CONFIDENCE = 0.45
-VEHICLE_DEVICE = f"cuda:{CUDA_DEVICE_ID}"
 TWO_WHEELER_CLASSES = {
     "motorcycle"
 }
@@ -356,8 +353,8 @@ camera_manager = None
 camera_captures = {}
 camera_capture_lock = threading.Lock()
 camera_frame_store = LatestFrameStore()
-gpu_inference_lock = threading.RLock()
-face_inference_lock = gpu_inference_lock
+model_inference_lock = threading.RLock()
+face_inference_lock = model_inference_lock
 shutdown_started = False
 
 known_embeddings = {}
@@ -610,72 +607,8 @@ def configure_h264_stream(camera_config):
 # ============================================================
 
 def get_onnx_providers():
-
-    preload_dlls = getattr(
-        ort,
-        "preload_dlls",
-        None
-    )
-
-    if (
-        preload_dlls is not None
-        and USE_GPU not in {
-            "false",
-            "0",
-            "no",
-            "off"
-        }
-    ):
-
-        preload_dlls()
-
-    available = ort.get_available_providers()
-
-    cuda_available = (
-        "CUDAExecutionProvider"
-        in available
-    )
-
-    if (
-        USE_GPU in {
-            "true",
-            "1",
-            "yes",
-            "on"
-        }
-        and not cuda_available
-    ):
-
-        raise RuntimeError(
-            "USE_GPU is enabled, but "
-            "CUDAExecutionProvider is unavailable."
-        )
-
-    if (
-        cuda_available
-        and USE_GPU not in {
-            "false",
-            "0",
-            "no",
-            "off"
-        }
-    ):
-
-        print(
-            f"[INFO] Using CUDA GPU "
-            f"{CUDA_DEVICE_ID}."
-        )
-
-        return [
-            "CUDAExecutionProvider",
-            "CPUExecutionProvider"
-        ]
-
     print("[INFO] Using CPU execution provider.")
-
-    return [
-        "CPUExecutionProvider"
-    ]
+    return ["CPUExecutionProvider"]
 
 
 def initialize_face_model():
@@ -709,12 +642,7 @@ def initialize_face_model():
     )
 
     face_app.prepare(
-        ctx_id=(
-            CUDA_DEVICE_ID
-            if "CUDAExecutionProvider"
-            in providers
-            else -1
-        ),
+        ctx_id=-1,
         det_size=DET_SIZE,
         det_thresh=DET_THRESH
     )
@@ -2013,19 +1941,16 @@ def initialize_auth_accounts():
         conn.close()
 
 
-def safe_gpu_inference(operation, *args, **kwargs):
-    """Centralize all GPU model execution behind one lock.
-
-    RTSP workers can still run in parallel, but the shared CUDA/ONNX session is
-    only entered through this single execution path. This prevents concurrent
-    InsightFace and YOLO calls from racing each other on the same GPU context.
-    """
-    with gpu_inference_lock:
+def safe_model_inference(operation, *args, **kwargs):
+    """Serialize model calls and pin YOLO prediction to CPU."""
+    if getattr(operation, "__name__", "") == "predict":
+        kwargs["device"] = INFERENCE_DEVICE
+    with model_inference_lock:
         return operation(*args, **kwargs)
 
 
 def safe_face_inference(frame):
-    """Serialize GPU InsightFace calls across all camera workers."""
+    """Serialize InsightFace calls across all camera workers."""
     if face_app is None:
         return []
     with face_inference_lock:
@@ -2253,19 +2178,12 @@ def safe_registration_face_inference(frame):
         if primary_faces:
             return primary_faces
 
-        diagnostics = _face_runtime_diagnostics()
-        providers = diagnostics["providers"]
-        fallback_ctx_id = (
-            CUDA_DEVICE_ID
-            if "CUDAExecutionProvider" in providers
-            else -1
-        )
         print(
             "[REGISTRATION FALLBACK] primary_faces=0 "
             f"det_size={DET_SIZE} -> fallback_det_size={REGISTRATION_FALLBACK_DET_SIZE}"
         )
         face_app.prepare(
-            ctx_id=fallback_ctx_id,
+            ctx_id=-1,
             det_size=REGISTRATION_FALLBACK_DET_SIZE,
             det_thresh=DET_THRESH,
         )
@@ -2306,7 +2224,7 @@ def safe_registration_face_inference(frame):
             # Registration is allowed to use a larger detector input, but the
             # shared live pipeline must return to its production configuration.
             face_app.prepare(
-                ctx_id=fallback_ctx_id,
+                ctx_id=-1,
                 det_size=DET_SIZE,
                 det_thresh=DET_THRESH,
             )
@@ -2399,17 +2317,17 @@ def _registration_image_diagnostics(raw, image, orientation):
 
 
 def safe_person_inference(frame):
-    """Serialize shared YOLO person inference on the GPU."""
+    """Serialize shared YOLO person inference on CPU."""
     if person_detector is None:
         raise RuntimeError("Person detector is not initialized.")
-    return safe_gpu_inference(person_detector.predict, frame, classes=[0], conf=PERSON_CONFIDENCE, iou=PERSON_IOU, verbose=False)
+    return safe_model_inference(person_detector.predict, frame, classes=[0], conf=PERSON_CONFIDENCE, iou=PERSON_IOU, verbose=False)
 
 
 def safe_vehicle_inference(frame):
-    """Serialize shared YOLO vehicle inference on the GPU."""
+    """Serialize shared YOLO vehicle inference on CPU."""
     if vehicle_detector is None:
         raise RuntimeError("Vehicle detector is not initialized.")
-    return safe_gpu_inference(vehicle_detector.predict, frame, conf=VEHICLE_CONFIDENCE, device=VEHICLE_DEVICE, verbose=False)
+    return safe_model_inference(vehicle_detector.predict, frame, conf=VEHICLE_CONFIDENCE, verbose=False)
 
 
 def recognize_face(face, camera_id=None):
@@ -3432,7 +3350,7 @@ def camera_worker(camera_config, rtsp_url=None):
                                 camera_id=camera_id,
                                 person_tracks=person_tracks,
                                 roi_polygon=roi_polygon,
-                                inference=safe_gpu_inference,
+                                inference=safe_model_inference,
                                 now=time.time(),
                             )
                             for fall in confirmed_falls:
@@ -3468,7 +3386,7 @@ def camera_worker(camera_config, rtsp_url=None):
                                 camera_id=camera_id,
                                 person_tracks=person_tracks,
                                 roi_polygon=roi_polygon,
-                                inference=safe_gpu_inference,
+                                inference=safe_model_inference,
                                 now=time.time(),
                             )
                             for helmet in confirmed_helmets:
@@ -3503,7 +3421,7 @@ def camera_worker(camera_config, rtsp_url=None):
                                 frame=frame,
                                 camera_id=camera_id,
                                 roi_polygon=roi_polygon,
-                                inference=safe_gpu_inference,
+                                inference=safe_model_inference,
                                 now=time.time(),
                             )
                             for theft in theft_alerts:
@@ -3542,7 +3460,7 @@ def camera_worker(camera_config, rtsp_url=None):
                                 frame=frame,
                                 camera_id=camera_id,
                                 roi_polygon=roi_polygon,
-                                inference=safe_gpu_inference,
+                                inference=safe_model_inference,
                                 now=time.time(),
                             )
                             for incident in confirmed_incidents:

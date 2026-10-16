@@ -67,7 +67,7 @@ compatibility files currently re-export behavior from the active monolith.
 | RTSP | `alcon_stream_new.py`, `camera/rtsp.py` | `build_rtsp_url`, `configure_h264_stream`, OpenCV capture and reconnect |
 | Camera lifecycle | `camera/manager.py` | `CameraManager`, `ManagedWorker` |
 | Frame pipeline | `alcon_stream_new.py` | `camera_worker` |
-| GPU/model execution | `alcon_stream_new.py`, `ai/models.py` | one `gpu_inference_lock`, one person YOLO, one vehicle YOLO, one FaceAnalysis |
+| CPU/model execution | `alcon_stream_new.py`, `ai/models.py` | serialized CPU inference, one person YOLO, one vehicle YOLO, one FaceAnalysis |
 | Person detection | `alcon_stream_new.py`, `ai/person.py` | `safe_person_inference`, `detect_person_boxes` |
 | Vehicle detection | `alcon_stream_new.py`, `ai/vehicle.py` | `safe_vehicle_inference`, `detect_vehicle_boxes`, vehicle ROI and validation |
 | Face detection | `alcon_stream_new.py`, `ai/face.py` | `safe_face_inference`, InsightFace geometry checks |
@@ -90,7 +90,7 @@ refactor:
 - `camera_event_managers`
 - `known_embeddings`, `known_face_templates`, `known_person_metadata`
 - `person_detector`, `vehicle_detector`, `face_app`
-- `gpu_inference_lock` and its face-inference compatibility alias
+- `model_inference_lock` and its face-inference compatibility alias
 - `alert_history`, `connected_clients`, `shutdown_event`, `camera_manager`
 
 Camera worker state such as unknown presence, last vehicles, last faces, and
@@ -101,6 +101,9 @@ a process-wide dictionary unless the behavior is kept camera-specific.
 
 Camera definitions remain in `config/cameras.json`. Each item contains the
 camera ID, display name, NVR address, KPI, enabled flag, channel, and subtype.
+CAM001 uses the `known_unknown` KPI for annotated known/unknown person detection;
+vehicle inference is enabled only for cameras configured with the `vehicle` KPI.
+YOLO and InsightFace inference are pinned to CPU, regardless of GPU availability.
 An optional `RTSP_URL` or `rtsp_url` is an explicit endpoint override and takes
 precedence over the NVR/channel/subtype fallback. URL credentials in the
 configuration are discarded; the worker uses `ALCON_PASSWORD` from the
@@ -268,7 +271,7 @@ Each worker repeatedly opens its configured RTSP URL and reconnects after
 repeated read failures. Every second frame is processed. The worker:
 
 1. Detects person boxes with YOLO class `0` and existing plausibility checks.
-2. Runs vehicle YOLO only for vehicle-KPI cameras at the existing cadence.
+2. Runs vehicle YOLO on CPU only for vehicle-KPI cameras at the existing cadence.
 3. Filters vehicles through the current camera's `vehicle.points` polygon;
 	the box center or bottom-center must be inside the polygon.
 4. Runs InsightFace under the one global inference lock.
