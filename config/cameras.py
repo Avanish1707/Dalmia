@@ -3,11 +3,36 @@
 import json
 import os
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 from config.settings import PROJECT_ROOT
 
-DEFAULT_NVR_IP = os.getenv("NVR_IP", "115.247.225.82")
+DEFAULT_NVR_IP = os.getenv("NVR_IP", "192.168.191.40")
 CAMERA_CONFIG_PATH = PROJECT_ROOT / "config" / "cameras.json"
+
+
+def _endpoint_without_credentials(rtsp_url, camera_id):
+    if not isinstance(rtsp_url, str) or not rtsp_url.strip():
+        raise ValueError(f"Invalid RTSP_URL for {camera_id!r}")
+    try:
+        endpoint = urlsplit(rtsp_url.strip())
+        port = endpoint.port
+    except ValueError as exc:
+        raise ValueError(f"Invalid RTSP_URL for {camera_id!r}") from exc
+    if (
+        endpoint.scheme.lower() not in {"rtsp", "rtsps"}
+        or not endpoint.hostname
+        or not endpoint.path
+    ):
+        raise ValueError(f"Invalid RTSP_URL for {camera_id!r}")
+
+    host = endpoint.hostname
+    if ":" in host:
+        host = f"[{host}]"
+    netloc = f"{host}:{port}" if port is not None else host
+    return urlunsplit(
+        (endpoint.scheme, netloc, endpoint.path, endpoint.query, "")
+    )
 
 
 def load_cameras(config_path=CAMERA_CONFIG_PATH):
@@ -61,6 +86,12 @@ def load_cameras(config_path=CAMERA_CONFIG_PATH):
             "channel": channel,
             "subtype": subtype,
         }
+        configured_rtsp_url = item.get("RTSP_URL") or item.get("rtsp_url")
+        if configured_rtsp_url is not None:
+            camera["rtsp_url"] = _endpoint_without_credentials(
+                configured_rtsp_url,
+                camera_id,
+            )
         cameras.append(camera)
 
     enabled_override = os.getenv("ENABLED_CAMERAS", "").strip()

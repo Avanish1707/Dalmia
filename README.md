@@ -100,18 +100,95 @@ a process-wide dictionary unless the behavior is kept camera-specific.
 
 Camera definitions remain in `config/cameras.json`. Each item contains the
 camera ID, display name, NVR address, KPI, enabled flag, channel, and subtype.
+An optional `RTSP_URL` or `rtsp_url` is an explicit endpoint override and takes
+precedence over the NVR/channel/subtype fallback. URL credentials in the
+configuration are discarded; the worker uses `ALCON_PASSWORD` from the
+environment with the existing `admin` username. Do not commit credentials.
+
+Subtypes follow the camera configuration contract: `1` is main stream
+(`/Streaming/Channels/101` for channel 1) and `2` is substream
+(`/Streaming/Channels/102`). A configured URL path overrides that mapping.
 Environment overrides are supported for each camera:
 
 ```env
 ENABLED_CAMERAS=CAM001,CAM003
-CAM001_NVR_IP=115.247.225.82
+CAM001_NVR_IP=192.168.191.40
 CAM001_CHANNEL=1
-CAM001_SUBTYPE=2
+CAM001_SUBTYPE=1
 CAM001_ENABLED=true
+# Set ALCON_PASSWORD out of band; never commit its value.
 ```
 
 `ENABLED_CAMERAS=ALL` enables every configured camera. Invalid camera IDs are
 rejected. `config/cameras.py` is now the owner of this loading behavior.
+
+### Windows RTSP diagnostics
+
+Run these checks from PowerShell on the WAVE host. A TCP success only confirms
+reachability to the RTSP port; it does not validate credentials or the stream
+path.
+
+```powershell
+Test-NetConnection 192.168.191.40 -Port 554
+Get-Command ffmpeg, ffprobe -ErrorAction SilentlyContinue
+```
+
+If FFmpeg/FFprobe are missing, install a Windows FFmpeg build (for example,
+`winget install --id Gyan.FFmpeg.Shared --exact`), open a new PowerShell
+session, and verify with:
+
+```powershell
+ffmpeg -version
+ffprobe -version
+```
+
+If either command is still not found, add the FFmpeg `bin` directory (the
+directory containing both executables) to the user or system `PATH`, then
+restart PowerShell. Do not download executables from untrusted mirrors.
+
+To probe both candidate streams over RTSP/TCP, enter the password only at the
+secure prompt below. FFprobe debug output can echo a URL, so the script masks
+URL credentials and query strings before displaying the captured response.
+The URL is necessarily passed to the local FFprobe process; run this only on a
+trusted host and do not paste unfiltered output into logs or tickets.
+
+```powershell
+$secure = Read-Host 'NVR password' -AsSecureString
+$ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+try {
+    $password = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr)
+} finally {
+    [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr)
+}
+$escapedPassword = [Uri]::EscapeDataString($password)
+foreach ($path in '101', '102') {
+    $url = "rtsp://admin:$escapedPassword@192.168.191.40:554/Streaming/Channels/$path"
+    "=== stream $path ==="
+    $output = & ffprobe -v debug -rtsp_transport tcp -timeout 10000000 `
+        -select_streams v:0 -show_entries stream=codec_name,profile,width,height `
+        -of default=noprint_wrappers=1 $url 2>&1
+    $exitCode = $LASTEXITCODE
+    $output | ForEach-Object {
+        "$_" -replace '(?i)(rtsp://[^:/\s]+:)[^@/\s]+@', '$1***@' `
+            -replace '(?i)(rtsp://[^?\s]+)\?[^\s]+', '$1?<redacted>'
+    }
+    "ffprobe exit code: $exitCode"
+}
+$password = $null
+$escapedPassword = $null
+$url = $null
+```
+
+Interpret the results by stage: TCP timeout/refusal indicates routing,
+firewall, or RTSP service reachability; RTSP `401` indicates authentication;
+`404` on `DESCRIBE`/`OPTIONS` usually indicates an invalid endpoint/path or an
+unsupported method; `SETUP` `500` means the NVR rejected stream setup after
+reaching the endpoint and warrants checking the channel/substream configuration
+and NVR firmware/logs. A successful RTSP negotiation followed by codec or
+parameter errors points to stream encoding/codec negotiation. Compare the two
+paths using the same credentials and TCP transport before changing the
+application configuration. `ffprobe` not being found is a local tool/PATH
+issue, not evidence about RTSP validity.
 
 The active ROI values are in `roi/camera_rois.py`. `CAMERA_ROIS` contains one
 independent entry for every configured camera. Edit only the camera you want:

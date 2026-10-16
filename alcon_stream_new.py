@@ -5,7 +5,7 @@ import threading
 import base64
 import hmac
 from pathlib import Path
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote
 from urllib.parse import urlencode
 from urllib.request import HTTPDigestAuthHandler, HTTPPasswordMgrWithDefaultRealm, build_opener
 import json
@@ -34,7 +34,7 @@ from dotenv import load_dotenv
 
 # Load deployment switches before importing camera and KPI configuration
 # modules, which read their values at module initialization time.
-load_dotenv()
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
@@ -45,6 +45,7 @@ from insightface.app import FaceAnalysis
 from detection_database import DetectionDatabase
 from detection_events import DetectionEventManager
 from camera.manager import CameraManager, LatestFrameStore
+from camera.rtsp_url import build_rtsp_url, redact_rtsp_url
 from config.cameras import CAMERAS, enabled_cameras
 from roi.camera_rois import get_camera_roi
 from fall_detection import FallDetector
@@ -602,106 +603,6 @@ def configure_h264_stream(camera_config):
         _camera_log(camera_config["camera_id"], "Camera streams configured to H.264.")
     except Exception as e:
         _camera_log(camera_config["camera_id"], f"Could not configure camera to H.264: {e}")
-
-def _redact_rtsp_url(rtsp_url):
-    try:
-        scheme, remainder = rtsp_url.split("://", 1)
-        auth, rest = remainder.split("@", 1)
-        username, _, _ = auth.partition(":")
-        return f"{scheme}://{username}:***@{rest}"
-    except ValueError:
-        return rtsp_url
-
-
-
-def build_rtsp_url(camera_config):
-    configured_url = (
-        camera_config.get("RTSP_URL")
-        or camera_config.get("rtsp_url")
-    )
-
-    if configured_url:
-        return configured_url.strip()
-
-    if not NVR_PASSWORD:
-        raise RuntimeError(
-            "ALCON_PASSWORD environment variable is not set."
-        )
-
-    username = quote(NVR_USERNAME, safe="")
-    password = quote(NVR_PASSWORD, safe="")
-
-    nvr_ip = camera_config.get("nvr_ip", DEFAULT_NVR_IP)
-    channel = int(camera_config.get("channel", 1))
-    subtype = int(camera_config.get("subtype", 1))
-
-    # subtype 0 = main stream; subtype 1 = substream
-    stream_number = 1 if subtype == 0 else 2
-    channel_path = channel * 100 + stream_number
-
-    return (
-        f"rtsp://{username}:{password}@{nvr_ip}:{RTSP_PORT}"
-        f"/Streaming/Channels/{channel_path}"
-    )
-
-    # Prefer the exact RTSP URL configured for this camera.
-    # Supports both the uppercase key shown in cameras.json
-    # and the lowercase alternative.
-    configured_url = (
-        camera_config.get("RTSP_URL")
-        or camera_config.get("rtsp_url")
-    )
-
-    if configured_url:
-        return configured_url.strip()
-
-    # Otherwise construct the Hikvision-style URL.
-    if not NVR_PASSWORD:
-        raise RuntimeError(
-            "ALCON_PASSWORD environment variable is not set."
-        )
-
-    user = quote(NVR_USERNAME, safe="")
-    password = quote(NVR_PASSWORD, safe="")
-
-    nvr_ip = camera_config.get("nvr_ip", DEFAULT_NVR_IP)
-    channel = int(camera_config.get("channel", 1))
-    subtype = int(camera_config.get("subtype", 1))
-
-    # Conventional mapping: subtype 0 = main, subtype 1 = substream.
-    stream_number = 1 if subtype == 0 else 2
-
-    return (
-        f"rtsp://{user}:{password}@{nvr_ip}:{RTSP_PORT}"
-        f"/Streaming/Channels/{channel}{stream_number}"
-    )
-
-
-    if not NVR_PASSWORD:
-
-        raise RuntimeError(
-            "ALCON_PASSWORD environment variable is not set."
-        )
-
-    user = quote(
-        NVR_USERNAME,
-        safe=""
-    )
-
-    password = quote(
-        NVR_PASSWORD,
-        safe=""
-    )
-
-    channel = int(camera_config.get("channel", 1))
-    subtype = int(camera_config.get("subtype", 1))
-
-    return (
-        f"rtsp://{user}:{password}@"
-        f"{camera_config.get('nvr_ip', DEFAULT_NVR_IP)}:{RTSP_PORT}"
-        f"/{channel}/{subtype}"
-    )
-
 
 # ============================================================
 # INSIGHTFACE
@@ -3360,9 +3261,6 @@ def camera_worker(camera_config, rtsp_url=None):
         scope = "CAM008_ONLY" if _should_run_kpi(camera_id, "helmet") else "DISABLED"
         _camera_log(camera_id, f"[HELMET] ENABLED | scope={scope}")
 
-    if rtsp_url is None:
-        rtsp_url = build_rtsp_url(camera_config)
-
     frame_counter = 0
     camera_status = "Starting..."
     last_alert_time = 0.0
@@ -3398,6 +3296,9 @@ def camera_worker(camera_config, rtsp_url=None):
         cap = None
         try:
 
+            if rtsp_url is None:
+                rtsp_url = build_rtsp_url(camera_config)
+
             _camera_log(
                 camera_id,
                 (
@@ -3410,7 +3311,7 @@ def camera_worker(camera_config, rtsp_url=None):
                 _camera_log(
                     camera_id,
                     f"[RTSP OPEN] camera={camera_id} channel={camera_config['channel']} "
-                    f"subtype={camera_config['subtype']} url={_redact_rtsp_url(rtsp_url)}",
+                    f"subtype={camera_config['subtype']} url={redact_rtsp_url(rtsp_url)}",
                 )
             cap = cv2.VideoCapture(
                 rtsp_url,
@@ -4971,6 +4872,8 @@ def camera_worker(camera_config, rtsp_url=None):
 
             if cap is not None:
                 _release_camera_capture(camera_id)
+            if not shutdown_event.is_set():
+                shutdown_event.wait(5)
         except Exception as e:
 
             camera_status = (
