@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WAVE VMS Login</title>
+  <style>
+    :root { color-scheme: dark; font-family: Segoe UI, Arial, sans-serif; background: #0b1220; color: #e5e7eb; }
+    body { min-height: 100vh; margin: 0; display: grid; place-items: center; }
+    main { width: min(360px, calc(100% - 40px)); padding: 28px; background: #111b2d; border: 1px solid #26344b; border-radius: 14px; }
+    h1 { margin: 0 0 8px; font-size: 1.5rem; }
+    p { color: #9ca3af; margin: 0 0 22px; }
+    label { display: block; margin: 14px 0 6px; font-size: .9rem; }
+    input, select, button { box-sizing: border-box; width: 100%; padding: 11px; border: 1px solid #35445c; border-radius: 8px; background: #0b1220; color: #e5e7eb; }
+    button { margin-top: 20px; border: 0; background: #2563eb; font-weight: 600; cursor: pointer; }
+    .error { color: #fca5a5; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>WAVE VMS</h1>
+    <p>Sign in with your existing VMS account to view cameras.</p>
+    {% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+    <form method="post">
+      <label for="role">Account type</label>
+      <select id="role" name="role">
+        <option value="user">User</option>
+        <option value="admin">Administrator</option>
+      </select>
+      <label for="username">Username</label>
+      <input id="username" name="username" autocomplete="username" required>
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" required>
+      <button type="submit">Sign in</button>
+    </form>
+  </main>
+</body>
+</html>

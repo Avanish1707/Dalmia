@@ -5,17 +5,30 @@ import threading
 import base64
 import hmac
 from pathlib import Path
-from urllib.parse import quote
-from urllib.parse import urlencode
 from urllib.request import HTTPDigestAuthHandler, HTTPPasswordMgrWithDefaultRealm, build_opener
 import json
 import hashlib
+import re
 import io
 import uuid
 import shutil
 import signal
 from collections import deque
 from types import SimpleNamespace
+from flask import (
+    Flask,
+    Response,
+    jsonify,
+    redirect,
+    render_template,
+    request,
+    send_from_directory,
+    session,
+    url_for,
+)
+from flask_cors import CORS
+from flask_socketio import SocketIO, join_room, leave_room
+from urllib.parse import quote, urlencode, urlsplit
 
 import firebase_admin
 from firebase_admin import credentials, messaging
@@ -36,16 +49,13 @@ from dotenv import load_dotenv
 # modules, which read their values at module initialization time.
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
-from flask import Flask, jsonify, request, send_from_directory
-from flask_cors import CORS
-from flask_socketio import SocketIO, join_room, leave_room
-
 from database import validate_postgres_connection
 from insightface.app import FaceAnalysis
 from detection_database import DetectionDatabase
 from detection_events import DetectionEventManager
 from camera.manager import CameraManager, LatestFrameStore
 from camera.rtsp_url import build_rtsp_url, redact_rtsp_url
+from notifications.email import EmailAlertQueue, EmailConfig
 from config.cameras import CAMERAS, enabled_cameras
 from roi.camera_rois import get_camera_roi
 from fall_detection import FallDetector
@@ -254,11 +264,14 @@ PUBLIC_BASE_URL = os.getenv(
 STREAM_JPEG_QUALITY = 65
 STREAM_MAX_WIDTH = 800
 STREAM_TARGET_FPS = 10
-SOCKET_LIVE_FPS = float(os.getenv("SOCKET_LIVE_FPS", "8"))
-SOCKET_JPEG_QUALITY = int(os.getenv("SOCKET_JPEG_QUALITY", "70"))
+STREAM_LIVE_FPS = float(
+    os.getenv("DASHBOARD_STREAM_FPS", os.getenv("SOCKET_LIVE_FPS", "8"))
+)
+STREAM_JPEG_QUALITY = int(
+    os.getenv("DASHBOARD_JPEG_QUALITY", os.getenv("SOCKET_JPEG_QUALITY", "70"))
+)
 MAIN_FRAME_MAX_AGE_MS = int(os.getenv("MAIN_FRAME_MAX_AGE_MS", "2000"))
 MAX_AI_FRAME_AGE_MS = int(os.getenv("MAX_AI_FRAME_AGE_MS", "2000"))
-MAX_SOCKET_FRAME_AGE_MS = int(os.getenv("MAX_SOCKET_FRAME_AGE_MS", "2000"))
 VIDEO_LATENCY_DEBUG = os.getenv("VIDEO_LATENCY_DEBUG", "false").strip().lower() in {
     "1", "true", "yes", "on"
 }
@@ -301,6 +314,13 @@ os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
 # ============================================================
 
 app = Flask(__name__)
+app.secret_key = os.getenv("FLASK_SECRET_KEY")
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=os.getenv("SESSION_COOKIE_SECURE", "false").strip().lower()
+    in {"1", "true", "yes", "on"},
+)
 
 try:
     validate_postgres_connection()
@@ -336,8 +356,6 @@ camera_manager = None
 camera_captures = {}
 camera_capture_lock = threading.Lock()
 camera_frame_store = LatestFrameStore()
-latest_socket_frames = {}
-latest_socket_frame_lock = threading.Lock()
 gpu_inference_lock = threading.RLock()
 face_inference_lock = gpu_inference_lock
 shutdown_started = False
@@ -365,6 +383,7 @@ last_alert_time = 0.0
 alert_history = deque(maxlen=MAX_ALERT_HISTORY)
 
 connected_clients = 0
+email_alert_queue = None
 
 
 def _enabled_cameras():
@@ -410,26 +429,6 @@ def _camera_room(camera_id):
 def _camera_log(camera_id, message):
 
     print(f"[{camera_id}] {message}")
-
-
-def _queue_latest_socket_frame(payload):
-    """Replace a live preview payload instead of queueing video frames."""
-    with latest_socket_frame_lock:
-        latest_socket_frames[payload["camera_id"]] = payload
-
-
-def _socket_frame_emitter():
-    interval = 1.0 / max(SOCKET_LIVE_FPS, 1.0)
-    while not shutdown_event.is_set():
-        with latest_socket_frame_lock:
-            pending = list(latest_socket_frames.values())
-            latest_socket_frames.clear()
-        for payload in pending:
-            try:
-                socketio.emit("face_frame", payload)
-            except Exception as error:
-                print(f"[SOCKET] live frame emit failed: {error}")
-        shutdown_event.wait(interval)
 
 
 def _should_run_kpi(camera_id, kpi_name):
@@ -482,6 +481,7 @@ def _camera_snapshot(camera_id=None):
         status = state["status"]
         camera_name = state["camera_name"]
         timestamp = state["latest_frame_timestamp"]
+        connected = state["connected"]
     if frame is None:
         with latest_frame_lock:
             frame = latest_annotated_frames.get(camera_id)
@@ -489,6 +489,7 @@ def _camera_snapshot(camera_id=None):
         "camera_id": camera_id,
         "camera_name": camera_name,
         "status": status,
+        "connected": connected,
         "timestamp": timestamp,
         "frame": frame,
     }
@@ -1295,6 +1296,8 @@ def _send_fcm_to_active_tokens(
     role=None,
 ):
 
+    if not firebase_admin._apps:
+        initialize_firebase()
     rows = _active_fcm_token_rows(role=role)
     tokens = [row[0] for row in rows if row and row[0]]
     if not tokens:
@@ -1370,6 +1373,8 @@ def _send_fcm_to_all_tokens(
     role=None,
 ):
 
+    if not firebase_admin._apps:
+        initialize_firebase()
     rows = _all_fcm_token_rows(role=role)
     tokens = [row[0] for row in rows if row and row[0]]
     if not tokens:
@@ -3102,6 +3107,13 @@ def save_alert_image(frame):
     )
 
 
+def _queue_email_alert(event, attachment_path=None):
+    if email_alert_queue is None:
+        print("[WARNING] Email alert not queued: email delivery is not configured.")
+        return False
+    return email_alert_queue.submit(event, attachment_path=attachment_path)
+
+
 # ============================================================
 # ALERT HANDLING
 # ============================================================
@@ -3168,48 +3180,38 @@ def push_alert(
     )
 
 
-    # --------------------------------------------------------
-    # Firebase Cloud Messaging
-    # --------------------------------------------------------
+    attachment_filename = Path(urlsplit(image_url).path).name if image_url else ""
+    return _queue_email_alert(
+        {
+            "id": notification_id,
+            "title": "New Person Detected",
+            "message": message,
+            "detection_type": "person_detected",
+            "detected_at": entry["time"],
+            "camera_id": camera_id,
+            "camera_name": camera_name or gate_name,
+            "gate_name": gate_name,
+            "image_url": image_url,
+        },
+        attachment_path=(
+            ALERT_IMAGE_DIR / attachment_filename if attachment_filename else None
+        ),
+    )
 
-    try:
-        response = _send_fcm_to_all_tokens(
-            title="New Person Detected",
-            body=message,
-            data={
-                "type": "person_detected",
-                "notification_id": notification_id,
-                "title": "New Person Detected",
-                "message": message,
-                "camera_id": camera_id or "",
-                "camera_name": camera_name or gate_name,
-                "gate": gate_name,
-                "image_url": image_url,
-            },
-            image_url=(
-                image_url
-                if image_url
-                else None
-            ),
-        )
 
+def initialize_email_alerts():
+    global email_alert_queue
+
+    config = EmailConfig.from_env()
+    if config is None:
+        email_alert_queue = None
         print(
-            "[INFO] Firebase notification sent:"
+            "[WARNING] Email alerts are not configured; "
+            "set MAIL_HOST, MAIL_PORT, MAIL_FROM, and ALERT_EMAIL_TO."
         )
-
-        print(response)
-
-        print(
-            f"[INFO] Alert image URL: "
-            f"{image_url}"
-        )
-
-    except Exception as e:
-
-        print(
-            f"[ERROR] Firebase notification "
-            f"failed: {e}"
-        )
+        return
+    email_alert_queue = EmailAlertQueue(config)
+    email_alert_queue.start()
 
 
 def initialize_detection_events():
@@ -3225,8 +3227,7 @@ def initialize_detection_events():
             image_dir=ALERT_IMAGE_DIR,
             public_base_url=PUBLIC_BASE_URL,
             socketio=socketio,
-            firebase_topic=None,
-            fcm_sender=_send_fcm_to_all_tokens,
+            email_sender=_queue_email_alert,
             dedup_seconds=EXIT_CONFIRM_SECONDS,
             exit_frame_offset=EXIT_FRAME_OFFSET,
             camera_id=camera_config["camera_id"],
@@ -3287,9 +3288,7 @@ def camera_worker(camera_config, rtsp_url=None):
     last_frame_diagnostic_time = 0.0
     last_latency_diagnostic_time = 0.0
     last_rtsp_debug_time = 0.0
-    emit_interval = (
-        1.0 / max(SOCKET_LIVE_FPS, 1.0)
-    )
+    emit_interval = 1.0 / max(STREAM_LIVE_FPS, 1.0)
 
     while not shutdown_event.is_set():
 
@@ -3396,9 +3395,6 @@ def camera_worker(camera_config, rtsp_url=None):
                     last_rtsp_debug_time = time.time()
 
                 frame_counter += 1
-
-                faces_payload = []
-                vehicles_payload = []
 
                 if (
                     frame_counter
@@ -4405,115 +4401,7 @@ def camera_worker(camera_config, rtsp_url=None):
                         _camera_log(camera_id, f"[ERROR] Face processing error: {e}")
 
 
-                # ------------------------------------------------
-                # FACE PAYLOAD
-                # ------------------------------------------------
-
                 height, width = frame.shape[:2]
-
-                for vehicle in last_vehicles:
-                    x1, y1, x2, y2 = vehicle["box"]
-                    vehicles_payload.append(
-                        {
-                            "type": vehicle["vehicle_type"],
-                            "class_name": vehicle["class_name"],
-                            "confidence": round(vehicle["confidence"], 3),
-                            "box": {
-                                "x1": int(max(0, min(x1, width - 1))),
-                                "y1": int(max(0, min(y1, height - 1))),
-                                "x2": int(max(0, min(x2, width - 1))),
-                                "y2": int(max(0, min(y2, height - 1))),
-                            },
-                        }
-                    )
-
-                for face in last_faces:
-
-                    if (
-                        getattr(face, "recognized_name", "Unknown") == "Unknown"
-                        and not getattr(face, "unknown_evidence", False)
-                    ):
-                        continue
-
-                    x1, y1, x2, y2 = (
-                        face.bbox.astype(int)
-                    )
-                    recognized_name = getattr(
-                        face,
-                        "recognized_name",
-                        "Unknown"
-                    )
-
-                    faces_payload.append(
-                        {
-                            "name": recognized_name,
-                            "recognized_name": recognized_name,
-                            "score": round(
-                                float(
-                                    getattr(
-                                        face,
-                                        "recognition_score",
-                                        0.0
-                                    )
-                                ),
-                                3
-                            ),
-                            "recognition_score": round(
-                                float(
-                                    getattr(
-                                        face,
-                                        "recognition_score",
-                                        0.0
-                                    )
-                                ),
-                                3
-                            ),
-
-                            "box": {
-                                "x1": int(
-                                    max(
-                                        0,
-                                        min(
-                                            x1,
-                                            width - 1
-                                        )
-                                    )
-                                ),
-
-                                "y1": int(
-                                    max(
-                                        0,
-                                        min(
-                                            y1,
-                                            height - 1
-                                        )
-                                    )
-                                ),
-
-                                "x2": int(
-                                    max(
-                                        0,
-                                        min(
-                                            x2,
-                                            width - 1
-                                        )
-                                    )
-                                ),
-
-                                "y2": int(
-                                    max(
-                                        0,
-                                        min(
-                                            y2,
-                                            height - 1
-                                        )
-                                    )
-                                )
-                            }
-                        }
-                    )
-
-
                 # ------------------------------------------------
                 # ANNOTATED FRAME
                 # ------------------------------------------------
@@ -4785,7 +4673,7 @@ def camera_worker(camera_config, rtsp_url=None):
                         send_frame,
                         [
                             cv2.IMWRITE_JPEG_QUALITY,
-                            SOCKET_JPEG_QUALITY
+                            STREAM_JPEG_QUALITY
                         ]
                     )
 
@@ -4820,52 +4708,13 @@ def camera_worker(camera_config, rtsp_url=None):
                             latest_annotated_frames[camera_id] = encoded_bytes
 
 
-                        # ----------------------------------------
-                        # Socket.IO live frame
-                        # ----------------------------------------
-
-                        socket_age_ms = (
-                            max(0.0, (time.time() - main_packet["capture_timestamp"]) * 1000.0)
-                            if main_packet is not None
-                            else 0.0
-                        )
-                        socket_ms = 0.0
-                        if socket_age_ms <= MAX_SOCKET_FRAME_AGE_MS:
-                            socket_started_at = time.time()
-                            _queue_latest_socket_frame(
-                                {
-                                    "camera_id": camera_id,
-                                    "camera_name": camera_name,
-                                    "image": base64.b64encode(encoded_bytes).decode("utf-8"),
-                                    "width": send_frame.shape[1],
-                                    "height": send_frame.shape[0],
-                                    "faces": faces_payload,
-                                    "vehicles": vehicles_payload,
-                                    "status": camera_status,
-                                    "timestamp": now,
-                                    "frame_id": (
-                                        main_packet["frame_id"]
-                                        if main_packet is not None else frame_counter
-                                    ),
-                                    "stream": "main",
-                                }
-                            )
-                            socket_ms = (time.time() - socket_started_at) * 1000.0
-                        elif VIDEO_LATENCY_DEBUG:
-                            _camera_log(
-                                camera_id,
-                                f"[VIDEO-LATENCY] socket frame dropped age_ms={socket_age_ms:.0f}",
-                            )
-                            socket_ms = 0.0
                         if VIDEO_LATENCY_DEBUG and now - last_latency_diagnostic_time >= 5.0:
                             _camera_log(
                                 camera_id,
                                 "[VIDEO-LATENCY] "
                                 f"stream=MAIN frame_id={main_packet['frame_id'] if main_packet else frame_counter} "
-                                f"age_ms={socket_age_ms:.0f} "
                                 f"ai_ms={(jpeg_started_at - frame_processing_started_at) * 1000.0:.1f} "
-                                f"jpeg_ms={(time.time() - jpeg_started_at) * 1000.0:.1f} "
-                                f"socket_ms={socket_ms:.1f}",
+                                f"jpeg_ms={(time.time() - jpeg_started_at) * 1000.0:.1f}",
                             )
                             last_latency_diagnostic_time = now
 
@@ -5743,6 +5592,119 @@ def api_user_logout():
 
 
 # ============================================================
+# AUTHENTICATED CAMERA DASHBOARD
+# ============================================================
+
+@app.route("/dashboard/login", methods=["GET", "POST"])
+def dashboard_login():
+    if request.method == "GET":
+        if not app.secret_key:
+            return render_template(
+                "dashboard_login.html",
+                error="Dashboard login is not configured on this server.",
+            ), 503
+        if session.get("dashboard_user"):
+            return redirect(url_for("camera_dashboard"))
+        return render_template("dashboard_login.html", error=None)
+
+    if not app.secret_key:
+        app.logger.error("Dashboard login is unavailable: FLASK_SECRET_KEY is not configured")
+        return render_template(
+            "dashboard_login.html",
+            error="Dashboard login is not configured on this server.",
+        ), 503
+
+    role = _normalize_role(request.form.get("role", "user"))
+    username = str(request.form.get("username", "")).strip()
+    password = str(request.form.get("password", ""))
+    if not role or not username or not password:
+        return render_template(
+            "dashboard_login.html",
+            error="Enter a valid role, username, and password.",
+        ), 400
+
+    account = _auth_account_by_credentials(role, username, password)
+    if account is None:
+        return render_template(
+            "dashboard_login.html",
+            error="Invalid username or password.",
+        ), 401
+    session.clear()
+    session["dashboard_user"] = {"username": account[2], "role": role}
+    return redirect(url_for("camera_dashboard"))
+
+
+@app.route("/dashboard/logout", methods=["POST"])
+def dashboard_logout():
+    if not app.secret_key:
+        return redirect(url_for("dashboard_login"))
+    session.clear()
+    return redirect(url_for("dashboard_login"))
+
+
+@app.route("/")
+def dashboard_root():
+    return redirect(url_for("camera_dashboard"))
+
+
+@app.route("/dashboard")
+def camera_dashboard():
+    if not app.secret_key:
+        return render_template(
+            "dashboard_login.html",
+            error="Dashboard login is not configured on this server.",
+        ), 503
+    dashboard_user = session.get("dashboard_user")
+    if not dashboard_user:
+        return redirect(url_for("dashboard_login"))
+    return render_template("dashboard.html", dashboard_user=dashboard_user)
+
+
+@app.route("/video_feed/<camera_id>")
+def video_feed(camera_id):
+    if not app.secret_key:
+        return jsonify({"success": False, "message": "Dashboard authentication is not configured"}), 503
+    if not session.get("dashboard_user"):
+        return jsonify({"success": False, "message": "Authentication required"}), 401
+
+    selected_id = next(
+        (known_id for known_id in camera_states if known_id.lower() == camera_id.lower()),
+        None,
+    )
+    if selected_id is None:
+        return jsonify({"success": False, "message": "Camera not found"}), 404
+    state = camera_states[selected_id]
+
+    def stream_frames():
+        last_frame_counter = -1
+        while not shutdown_event.is_set():
+            with state["lock"]:
+                frame = state["latest_annotated_frame"]
+                frame_counter = state["frame_counter"]
+            if frame is None or frame_counter == last_frame_counter:
+                shutdown_event.wait(0.1)
+                continue
+            last_frame_counter = frame_counter
+            yield (
+                b"--frame\r\n"
+                b"Content-Type: image/jpeg\r\n"
+                b"Cache-Control: no-cache\r\n\r\n"
+                + frame
+                + b"\r\n"
+            )
+
+    return Response(
+        stream_frames(),
+        mimetype="multipart/x-mixed-replace; boundary=frame",
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+# ============================================================
 # SERVE ALERT IMAGES
 # ============================================================
 
@@ -5777,27 +5739,44 @@ def known_face_image(storage_key, filename):
 def _camera_api_status(camera):
     if not camera.get("enabled", False):
         return "disabled"
-
     snapshot = _camera_snapshot(camera["camera_id"])
     raw_status = snapshot["status"] if snapshot else "Starting..."
-    if raw_status == "LIVE":
-        return "online"
     if raw_status == "Starting...":
         return "connecting"
     if raw_status.startswith("Error:"):
-        return "error"
+        return "reconnecting"
     if raw_status.startswith("Stream lost") or raw_status.startswith("RTSP connection"):
-        return "offline"
-    return raw_status.lower()
+        return "reconnecting"
+    if raw_status == "LIVE" or (snapshot and snapshot["connected"]):
+        return "online"
+    return "offline"
+
+
+def _safe_camera_status_message(status):
+    message = str(status or "Unknown camera status")
+    password = os.getenv("ALCON_PASSWORD", "")
+    if password:
+        message = message.replace(password, "[redacted]")
+        message = message.replace(quote(password, safe=""), "[redacted]")
+    return re.sub(
+        r"rtsps?://[^\s\"'<>]+",
+        lambda match: redact_rtsp_url(match.group(0)),
+        message,
+        flags=re.IGNORECASE,
+    )[:300]
 
 
 def _camera_api_payload(camera):
+    snapshot = _camera_snapshot(camera["camera_id"])
     return {
         "camera_id": camera["camera_id"],
         "name": camera["name"],
         "kpi": camera.get("kpi", "person"),
         "channel": camera.get("channel"),
         "status": _camera_api_status(camera),
+        "status_message": _safe_camera_status_message(
+            snapshot["status"] if snapshot else "Starting..."
+        ),
         "enabled": bool(camera.get("enabled", False)),
     }
 
@@ -6185,7 +6164,7 @@ def test_notification():
         ), 503
 
 
-    push_alert(
+    queued = push_alert(
         "New person detected "
         f"on {default_camera['name']}",
         frame,
@@ -6194,12 +6173,17 @@ def test_notification():
         camera_name=default_camera["name"],
     )
 
+    if not queued:
+        return jsonify({
+            "success": False,
+            "error": "Email alert was not queued; check email configuration and worker status.",
+        }), 503
 
     return jsonify(
         {
             "success": True,
             "message":
-                "Test notification sent"
+                "Test email alert queued"
         }
     )
 
@@ -6281,26 +6265,17 @@ def main():
         "FACE RECOGNITION"
     )
 
-    print(
-        " FCM IMAGE NOTIFICATION ENABLED"
-    )
+    print(" EMAIL ALERTS AND HTTP CAMERA DASHBOARD")
 
     print("=" * 60)
 
 
     # ----------------------------------------
-    # Firebase
+    # Email delivery is independent of camera inference and Firebase.
     # ----------------------------------------
 
-    initialize_firebase()
+    initialize_email_alerts()
     initialize_camera_states()
-    latest_socket_frames.clear()
-    socket_frame_thread = threading.Thread(
-        target=_socket_frame_emitter,
-        name="socket-live-frame-emitter",
-        daemon=True,
-    )
-    socket_frame_thread.start()
 
 
     # ----------------------------------------
@@ -6368,13 +6343,12 @@ def main():
         f"{PUBLIC_BASE_URL}/alerts/"
     )
 
-    print(
-        "[INFO] FCM delivery: all registered devices"
-    )
+    print("[INFO] Dashboard: /dashboard")
+    print("[INFO] Detection alert delivery: configured email recipients")
 
     print(
         "[INFO] Socket.IO events: "
-        "'face_frame', 'face_alert', 'detection_event'"
+        "'face_alert', 'detection_event' (no video frames)"
     )
 
     print(
@@ -6410,7 +6384,8 @@ def main():
         shutdown_event.set()
         print("[INFO] Stopping camera workers...")
         camera_manager.stop_all(timeout=5)
-    socket_frame_thread.join(timeout=2)
+    if email_alert_queue is not None:
+        email_alert_queue.stop(timeout=20)
     print("[INFO] Flask/Socket.IO shutdown complete")
 
 

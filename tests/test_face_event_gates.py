@@ -22,7 +22,7 @@ class MemorySocket:
         self.events.append((name, event.copy()))
 
 
-def _manager(tmp_path, fcm_sender=None, camera_id="CAM001", camera_name="Gate 1"):
+def _manager(tmp_path, email_sender=None, camera_id="CAM001", camera_name="Gate 1"):
     database = MemoryDatabase()
     socket = MemorySocket()
     manager = DetectionEventManager(
@@ -30,7 +30,7 @@ def _manager(tmp_path, fcm_sender=None, camera_id="CAM001", camera_name="Gate 1"
         image_dir=tmp_path,
         public_base_url="https://example.invalid",
         socketio=socket,
-        fcm_sender=fcm_sender,
+        email_sender=email_sender,
         dedup_seconds=0.1,
         exit_frame_offset=0,
         camera_id=camera_id,
@@ -101,11 +101,11 @@ def test_unknown_publisher_rejects_missing_validation(tmp_path):
 def test_validated_unknown_can_use_existing_alert_pipeline(tmp_path):
     notifications = []
 
-    def fcm_sender(**payload):
+    def email_sender(**payload):
         notifications.append(payload)
-        return {"sent": 1}
+        return True
 
-    manager, database, socket = _manager(tmp_path, fcm_sender=fcm_sender)
+    manager, database, socket = _manager(tmp_path, email_sender=email_sender)
     event = {
         "detection_type": "unknown_person",
         "recognition_state": "UNKNOWN",
@@ -131,11 +131,11 @@ def test_validated_unknown_can_use_existing_alert_pipeline(tmp_path):
 def test_only_validated_unknown_track_publishes_on_exit(tmp_path):
     notifications = []
 
-    def fcm_sender(**payload):
+    def email_sender(**payload):
         notifications.append(payload)
-        return {"sent": 1}
+        return True
 
-    manager, database, socket = _manager(tmp_path, fcm_sender=fcm_sender)
+    manager, database, socket = _manager(tmp_path, email_sender=email_sender)
     frame = np.zeros((80, 80, 3), dtype=np.uint8)
     unknown_person = SimpleNamespace(
         recognized_name="Unknown",
@@ -178,7 +178,7 @@ def test_unknown_tracks_are_published_as_one_group(tmp_path):
     notifications = []
     manager, database, socket = _manager(
         tmp_path,
-        fcm_sender=lambda **payload: notifications.append(payload) or {"sent": 1},
+        email_sender=lambda **payload: notifications.append(payload) or True,
     )
     frame = np.zeros((100, 200, 3), dtype=np.uint8)
 

@@ -3,8 +3,8 @@
 Wave VMS is a Flask and Socket.IO surveillance service. It reads NVR RTSP
 streams, runs shared YOLO and InsightFace models, associates faces with
 person detections, recognizes registered employees, tracks ROI visits, saves
-finalized detection events, and sends live frames and alerts to the Android
-client.
+finalized detection events, sends alert emails asynchronously, and provides
+an authenticated browser dashboard with annotated camera streams.
 
 This repository is being refactored incrementally. The active behavior still
 lives in `alcon_stream_new.py`; the package modules introduced so far are
@@ -21,16 +21,16 @@ Use the project virtual environment on Windows:
 ```
 
 The server listens on `0.0.0.0:5000` by default. `python app.py` imports the
-`main()` entry point from `alcon_stream_new.py`, initializes Firebase, loads
-the models and database, starts enabled camera workers, and runs Flask-
-Socket.IO with the threaded async mode.
+`main()` entry point from `alcon_stream_new.py`, initializes email delivery
+when configured, loads the models and database, starts enabled camera
+workers, and runs Flask-Socket.IO with the threaded async mode.
 
 ## Current Architecture
 
 ```text
 app.py
   -> alcon_stream_new.main()
-		 -> Firebase initialization
+		 -> bounded asynchronous email-alert worker (when configured)
 		 -> camera configuration and state initialization
 		 -> shared YOLO person model
 		 -> shared YOLO vehicle model
@@ -46,7 +46,8 @@ app.py
 					  -> face/person/ROI validation
 					  -> individual-template recognition
 					  -> camera-local identity memory
-					  -> event manager and Socket.IO frame output
+					  -> event manager and latest annotated-frame buffer
+  -> authenticated dashboard and HTTP MJPEG streams
 ```
 
 `app.py` is already a small launcher. `camera/manager.py` owns worker
@@ -75,9 +76,9 @@ compatibility files currently re-export behavior from the active monolith.
 | Face cache | `alcon_stream_new.py` | `load_known_faces`, `refresh_known_faces_cache`, `known_face_templates`, metadata |
 | Database | `database/detection_database.py`, `alcon_stream_new.py` | detection records plus registration, embeddings, auth, FCM token SQL |
 | Events | `events/detection_events.py` | ROI tracking, exit confirmation, deduplication, image and event persistence |
-| Notifications | `alcon_stream_new.py`, `notifications/firebase.py` | Firebase initialization, token queries, FCM payloads |
+| Notifications | `notifications/email.py`, `alcon_stream_new.py` | Bounded email queue, SMTP delivery, legacy FCM compatibility |
 | Storage | `alcon_stream_new.py`, `events/detection_events.py` | `known_faces/<storage_key>/image_N.jpg`, alert images |
-| API and Socket.IO | `alcon_stream_new.py` | Flask routes, `face_frame`, `face_alert`, `detection_event`, camera rooms |
+| API and Socket.IO | `alcon_stream_new.py` | Flask routes, authenticated dashboard/MJPEG streams, `face_alert`, `detection_event`, camera rooms |
 
 ## Shared Runtime State
 
@@ -248,7 +249,8 @@ exactly-one-face rule.
 
 1. `app.py` imports `main` and calls it.
 2. `.env` is loaded and paths are resolved relative to the project directory.
-3. Firebase is initialized from `FIREBASE_SERVICE_ACCOUNT` or `pythonai.json`.
+3. The bounded email worker starts when SMTP settings are configured. Firebase
+   is not initialized as a prerequisite for detection alerts.
 4. Enabled camera records are loaded and camera state dictionaries are created.
 5. H.264 configuration is requested from each enabled NVR using HTTP digest auth.
 6. The person YOLO model, InsightFace `buffalo_l`, and vehicle YOLO model are
@@ -277,8 +279,8 @@ repeated read failures. Every second frame is processed. The worker:
 	same active track. Memory expires after the configured timeout.
 8. Builds known, unknown, vehicle, and camera-specific event payloads.
 9. Passes tracked events to `DetectionEventManager`.
-10. Draws annotations, resizes and JPEG-encodes the frame, updates camera
-	 state, and emits `face_frame`.
+10. Draws the existing annotations, resizes and JPEG-encodes the frame, and
+	 updates the camera's latest-frame buffer for HTTP MJPEG clients.
 
 ### Recognition
 
@@ -299,8 +301,44 @@ Unknown groups are held until the last member exits. Alert deduplication,
 unknown presence timing, and vehicle context remain camera-aware.
 
 Finalized events emit `detection_event`. Person alerts are appended to the
-bounded in-memory `alert_history`, emitted as `face_alert`, and sent to all
-active FCM devices using the existing payload fields.
+bounded in-memory `alert_history` and emitted as `face_alert`. Configured
+non-known detection alerts are queued for email delivery after the existing
+deduplication and persistence steps; the camera worker never performs SMTP
+requests. Evidence images are attached when available. SMTP failures retry a
+bounded number of times and do not interrupt inference. Firebase/FCM token
+registration code is retained for compatibility with separate mobile clients,
+but is not required for this email-alert path.
+
+### Browser dashboard and email setup
+
+Set `FLASK_SECRET_KEY` to a long random secret before exposing the dashboard.
+The dashboard login uses existing `admin`/`user` credentials from
+`auth_accounts`; the associated video feed requires the same browser session.
+Set `SESSION_COOKIE_SECURE=true` when served through HTTPS. Open
+`http://<server-host>:5000/dashboard` (or the HTTPS equivalent), sign in, and
+the page loads only enabled cameras from `/api/cameras`. Each feed uses
+`/video_feed/<camera_id>` and reconnects automatically through the browser's
+MJPEG image handling. The dashboard polls status independently so one failed
+camera does not block other feeds.
+
+To enable SMTP alert delivery, configure `MAIL_HOST`, `MAIL_PORT`, `MAIL_FROM`,
+and comma-separated `ALERT_EMAIL_TO`. `MAIL_USERNAME` and `MAIL_PASSWORD` must
+be set together when authentication is required. Choose exactly one of
+`MAIL_USE_TLS` (STARTTLS) or `MAIL_USE_SSL` for the configured provider.
+Partial or invalid settings fail startup with a clear configuration error;
+when all mail settings are blank, email delivery is explicitly disabled and
+the application logs a warning. `/api/test-notification` queues a test email
+using the latest default-camera frame. Do not use real SMTP credentials in
+tests.
+
+For deployment, install the existing requirements, set PostgreSQL, camera,
+dashboard-secret, and SMTP environment values, then restart the service behind
+the existing HTTPS reverse proxy. Confirm the dashboard, a known camera feed,
+and the `GET /api/detections` response before routing users to the updated
+release. No database migration is introduced. To roll back, stop the service
+and restore the previous application release; keep PostgreSQL data untouched.
+Email and dashboard environment variables can remain configured but will not
+be consumed by the restored application version.
 
 ## HTTP API Contract
 
@@ -328,11 +366,17 @@ codes, and response shapes are compatibility contracts.
 | GET | `/api/alerts` | Return in-memory alert history |
 | GET | `/api/detections` | Return persisted detection events |
 | GET | `/api/snapshot` | Return the latest selected-camera JPEG as base64 |
-| POST | `/api/test-notification` | Send a test alert using the latest default-camera frame |
+| POST | `/api/test-notification` | Queue a test email alert using the latest default-camera frame |
+| GET | `/dashboard/login` | Sign in to the browser dashboard using an existing VMS account |
+| POST | `/dashboard/login` | Authenticate an existing account for the browser dashboard |
+| GET | `/dashboard` | Authenticated multi-camera dashboard |
+| POST | `/dashboard/logout` | End the browser dashboard session |
+| GET | `/video_feed/<camera_id>` | Authenticated MJPEG stream of the latest annotated camera frames |
 
 Socket.IO handlers are `connect`, `disconnect`, `join_camera`, and
-`leave_camera`. The server emits `face_frame`, `face_alert`, and
-`detection_event`. Camera rooms use the `camera:<camera_id>` naming convention.
+`leave_camera`. The server emits alert and detection events (`face_alert`,
+`detection_event`); it no longer transmits continuous video frames through
+Socket.IO. Camera rooms use the `camera:<camera_id>` naming convention.
 
 ## Database and Files
 
@@ -406,20 +450,19 @@ Run the focused suite with:
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
-Current validation after the configuration/ROI phase: 10 tests pass. Two
-existing tests still fail in the GPU helper compatibility area: one patches
-`face_inference_lock` while the implementation uses `gpu_inference_lock`, and
-one expects an empty YOLO kwargs dictionary even though the production call
-must preserve its configured class/confidence/IoU arguments. These failures
-were present before this phase and are recorded rather than hidden.
+Current validation after the dashboard/email phase: all 36 repository tests
+pass, including the email configuration, asynchronous delivery, snapshot
+attachment, recipient retry, and existing detection-event gate tests.
 
-RTSP, Firebase, GPU model loading, and Android delivery require the matching
-deployment environment and live services; they are not exercised by the
-offline test suite. Before production rollout, verify startup logs, enabled
-camera isolation, five-template recognition, event deduplication, FCM
-delivery, Socket.IO payloads, and graceful shutdown.
+RTSP, PostgreSQL, GPU model loading, SMTP, and Android delivery require the
+matching deployment environment and live services; they are not exercised by
+the offline test suite. Before production rollout, verify startup logs,
+enabled camera isolation, five-template recognition, event deduplication,
+email delivery, Socket.IO alert payloads, MJPEG access controls, and graceful
+shutdown. Serve the application behind the existing production HTTPS reverse
+proxy; do not expose the Flask development server directly to the internet.
 
-## Files Modified in the Current Phase
+## Files Modified in Earlier Refactor Phases
 
 - `config/cameras.py`: new camera configuration owner.
 - `roi/camera_rois.py`: new ROI configuration owner.
@@ -428,3 +471,16 @@ delivery, Socket.IO payloads, and graceful shutdown.
 	diagnostics, and deduplicates person/vehicle detections.
 - `README.md`: complete architecture, workflow, API, state, migration, and
   validation documentation.
+
+## Files Updated for Email Alerts and Dashboard
+
+- `notifications/email.py`: bounded SMTP email queue, config validation,
+  retries, per-recipient handling, and evidence attachments.
+- `alcon_stream_new.py`, `events/detection_events.py`: enqueue alert emails
+  outside camera workers, serve authenticated dashboard/MJPEG routes, and
+  remove continuous Socket.IO frame transmission.
+- `templates/`: responsive multi-camera dashboard and existing-account login.
+- `.env.example`, `api/api_documentation.json`, and `README.md`: environment,
+  API, deployment, and rollback documentation.
+- `tests/test_email_alerts.py`, `tests/test_face_event_gates.py`: email
+  delivery and preserved event-gate coverage.

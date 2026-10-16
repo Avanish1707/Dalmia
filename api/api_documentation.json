@@ -11,6 +11,11 @@
     "enforced": false,
     "note": "Login validates credentials and registers an FCM device token. The current REST routes do not enforce a session or Bearer token."
   },
+  "dashboard_authentication": {
+    "mechanism": "Existing auth_accounts credentials stored in an HttpOnly Flask session",
+    "secret_key_environment_variable": "FLASK_SECRET_KEY",
+    "video_stream_access": "Requires an authenticated dashboard session"
+  },
   "common_errors": [
     {"status": 400, "body": {"success": false, "message": "Invalid or missing input"}},
     {"status": 401, "body": {"success": false, "message": "Invalid credentials"}},
@@ -176,6 +181,34 @@
       "success": {"status": 200, "body": "JPEG image binary"}
     }
   ],
+  "web_routes": [
+    {
+      "method": "GET",
+      "path": "/dashboard/login",
+      "purpose": "Displays the browser dashboard sign-in form for existing VMS accounts."
+    },
+    {
+      "method": "POST",
+      "path": "/dashboard/login",
+      "purpose": "Authenticates an existing admin or user account and establishes an HttpOnly browser session."
+    },
+    {
+      "method": "GET",
+      "path": "/dashboard",
+      "purpose": "Displays enabled cameras in a responsive dashboard; requires browser authentication."
+    },
+    {
+      "method": "POST",
+      "path": "/dashboard/logout",
+      "purpose": "Clears the browser dashboard session."
+    },
+    {
+      "method": "GET",
+      "path": "/video_feed/{camera_id}",
+      "purpose": "Streams the latest annotated camera frames as MJPEG; requires browser authentication.",
+      "errors": [401, 404]
+    }
+  ],
   "socket_io": {
     "url": "http://<server-ip>:5000",
     "client_to_server": [
@@ -185,7 +218,6 @@
       {"event": "leave_camera", "purpose": "Leaves the room for a camera.", "payload": {"camera_id": "CAM001"}, "response": {"success": true, "camera_id": "CAM001", "room": "camera_CAM001"}}
     ],
     "server_to_client": [
-      {"event": "face_frame", "purpose": "Streams live annotated frames.", "payload": {"camera_id": "CAM001", "camera_name": "MAIN GATE 01", "image": "<base64-jpeg>", "width": 1920, "height": 1080, "faces": [], "vehicles": [], "status": "LIVE"}},
       {"event": "face_alert", "purpose": "Sends an immediate unknown-person/person alert.", "payload": {"id": "notification-id", "time": 1730000000.0, "message": "New person detected", "gate": "MAIN GATE 01", "camera_id": "CAM001", "camera_name": "MAIN GATE 01", "image_url": "http://server:5000/alerts/image.jpg", "type": "person_detected"}},
       {"event": "detection_event", "purpose": "Sends every persisted detection event, including fall, smoke, and fire.", "payload": {"id": 101, "type": "smoke_detected", "camera_id": "CAM001", "camera_name": "MAIN GATE 01", "gate": "MAIN GATE 01", "confidence": 0.91, "image_url": "http://server:5000/alerts/image.jpg", "title": "Smoke Detected", "message": "Smoke detected at MAIN GATE 01"}}
     ]
@@ -193,6 +225,6 @@
   "external_integrations": [
     {"name": "RTSP/NVR stream", "purpose": "Reads live camera frames. It is not exposed as a public application REST API.", "protocol": "rtsp"},
     {"name": "NVR configuration endpoint", "purpose": "Configures H.264 stream settings before camera workers start.", "protocol": "http", "path": "/cgi-bin/configManager.cgi"},
-    {"name": "Firebase Cloud Messaging", "purpose": "Delivers push notifications to registered active device tokens.", "protocol": "Firebase Admin SDK"}
+    {"name": "SMTP provider", "purpose": "Delivers configured detection alert emails from a bounded background queue.", "protocol": "SMTP"}
   ]
 }

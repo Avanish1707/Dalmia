@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WAVE VMS Camera Dashboard</title>
+  <style>
+    :root { color-scheme: dark; font-family: Segoe UI, Arial, sans-serif; background: #0b1220; color: #e5e7eb; }
+    body { margin: 0; }
+    header { position: sticky; top: 0; z-index: 2; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 14px 22px; background: #111b2d; border-bottom: 1px solid #26344b; }
+    header h1 { margin: 0; font-size: 1.1rem; }
+    header span { color: #9ca3af; font-size: .9rem; }
+    button { border: 1px solid #35445c; border-radius: 7px; background: #18243a; color: #e5e7eb; padding: 8px 12px; cursor: pointer; }
+    main { padding: 20px; }
+    #camera-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 360px), 1fr)); gap: 16px; }
+    .camera { min-width: 0; overflow: hidden; border: 1px solid #26344b; border-radius: 12px; background: #111b2d; }
+    .camera-heading { display: flex; align-items: start; justify-content: space-between; gap: 12px; padding: 12px 14px; }
+    .camera-heading h2 { margin: 0 0 4px; font-size: 1rem; }
+    .camera-heading small, .status-message { color: #9ca3af; }
+    .status { display: flex; align-items: center; gap: 7px; white-space: nowrap; font-size: .85rem; }
+    .dot { width: 9px; height: 9px; border-radius: 50%; background: #9ca3af; }
+    .online .dot { background: #22c55e; }
+    .connecting .dot, .reconnecting .dot { background: #f59e0b; }
+    .offline .dot, .error .dot, .disabled .dot { background: #ef4444; }
+    .feed { display: block; width: 100%; aspect-ratio: 16 / 9; object-fit: contain; background: #05080e; cursor: zoom-in; }
+    .status-message { min-height: 1.2em; margin: 0; padding: 8px 14px 12px; font-size: .8rem; overflow-wrap: anywhere; }
+    #empty { color: #9ca3af; }
+    dialog { width: min(94vw, 1400px); max-width: none; padding: 0; border: 1px solid #35445c; border-radius: 10px; background: #05080e; color: white; }
+    dialog::backdrop { background: rgb(0 0 0 / 80%); }
+    dialog img { display: block; width: 100%; max-height: 86vh; object-fit: contain; }
+    dialog button { position: absolute; right: 10px; top: 10px; }
+    @media (max-width: 600px) { header { padding: 12px; } main { padding: 12px; } }
+  </style>
+</head>
+<body>
+  <header>
+    <div><h1>WAVE VMS Camera Dashboard</h1><span>Signed in as {{ dashboard_user.username }}</span></div>
+    <form action="{{ url_for('dashboard_logout') }}" method="post"><button type="submit">Sign out</button></form>
+  </header>
+  <main>
+    <p id="empty">Loading enabled cameras…</p>
+    <section id="camera-grid" aria-label="Enabled camera feeds"></section>
+  </main>
+  <dialog id="viewer">
+    <button id="close-viewer" type="button" aria-label="Close enlarged camera">Close</button>
+    <img alt="Enlarged live camera feed">
+  </dialog>
+  <script>
+    const grid = document.getElementById("camera-grid");
+    const empty = document.getElementById("empty");
+    const viewer = document.getElementById("viewer");
+    const viewerImage = viewer.querySelector("img");
+    const cards = new Map();
+
+    function feedUrl(cameraId) {
+      return `/video_feed/${encodeURIComponent(cameraId)}`;
+    }
+
+    function updateCamera(camera) {
+      let card = cards.get(camera.camera_id);
+      if (!card) {
+        card = document.createElement("article");
+        card.className = "camera";
+        const heading = document.createElement("div");
+        heading.className = "camera-heading";
+        const names = document.createElement("div");
+        const name = document.createElement("h2");
+        const id = document.createElement("small");
+        names.append(name, id);
+        const status = document.createElement("span");
+        status.className = "status";
+        const dot = document.createElement("i");
+        dot.className = "dot";
+        const statusText = document.createElement("span");
+        status.append(dot, statusText);
+        heading.append(names, status);
+        const image = document.createElement("img");
+        image.className = "feed";
+        image.alt = "Live annotated camera feed";
+        image.src = feedUrl(camera.camera_id);
+        image.addEventListener("click", () => {
+          viewerImage.src = feedUrl(camera.camera_id);
+          viewer.showModal();
+        });
+        image.addEventListener("error", () => {
+          window.setTimeout(() => {
+            if (image.isConnected) image.src = `${feedUrl(camera.camera_id)}?retry=${Date.now()}`;
+          }, 2000);
+        });
+        const detail = document.createElement("p");
+        detail.className = "status-message";
+        card.append(heading, image, detail);
+        card._nodes = { name, id, status, statusText, detail };
+        cards.set(camera.camera_id, card);
+        grid.append(card);
+      }
+      const status = camera.status || "offline";
+      card.className = `camera ${status}`;
+      card._nodes.name.textContent = camera.name || camera.camera_id;
+      card._nodes.id.textContent = camera.camera_id;
+      card._nodes.statusText.textContent = status.charAt(0).toUpperCase() + status.slice(1);
+      card._nodes.detail.textContent = camera.status_message || "";
+    }
+
+    async function refreshCameras() {
+      try {
+        const response = await fetch("/api/cameras", { cache: "no-store" });
+        if (!response.ok) throw new Error(`Camera API returned ${response.status}`);
+        const data = await response.json();
+        const cameras = (data.cameras || []).filter(camera => camera.enabled);
+        for (const camera of cameras) updateCamera(camera);
+        empty.hidden = cameras.length > 0;
+        empty.textContent = cameras.length ? "" : "No enabled cameras are configured.";
+      } catch (error) {
+        empty.hidden = false;
+        empty.textContent = `Unable to load cameras: ${error.message}`;
+      }
+    }
+
+    document.getElementById("close-viewer").addEventListener("click", () => viewer.close());
+    viewer.addEventListener("close", () => { viewerImage.removeAttribute("src"); });
+    refreshCameras();
+    window.setInterval(refreshCameras, 4000);
+  </script>
+</body>
+</html>

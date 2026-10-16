@@ -5,16 +5,16 @@ import time
 import uuid
 from collections import deque
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import cv2
 import numpy as np
-from firebase_admin import messaging
 from face_association import is_validated_unknown_face
 
 
 class DetectionEventManager:
     def __init__(self, database, image_dir, public_base_url, socketio,
-                 firebase_topic=None, fcm_sender=None,
+                 email_sender=None,
                  dedup_seconds=10.0, exit_frame_offset=5,
                  camera_id=None, camera_name=None):
         self.database = database
@@ -22,8 +22,7 @@ class DetectionEventManager:
         self.image_dir.mkdir(parents=True, exist_ok=True)
         self.public_base_url = public_base_url.rstrip("/")
         self.socketio = socketio
-        self.firebase_topic = firebase_topic
-        self.fcm_sender = fcm_sender
+        self.email_sender = email_sender
         self.exit_confirm_seconds = max(0.1, float(dedup_seconds))
         self.exit_frame_offset = max(0, int(exit_frame_offset))
         self.camera_id = camera_id
@@ -424,23 +423,21 @@ class DetectionEventManager:
         return self._publish(event, image, notify=notify)
 
     def _notify(self, event):
-        image_url = event["image_url"]
-        data = {key: str(value) for key, value in {"type": event["detection_type"], "detection_id": event["id"], "camera_id": event.get("camera_id", self.camera_id or ""), "camera_name": event.get("camera_name", self.camera_name or ""), "gate": event["gate_name"], "image_url": image_url, "confidence": event.get("confidence", ""), "unknown_count": event.get("unknown_count", ""), "detected_at": event["detected_at"]}.items()}
-        if self.fcm_sender is not None:
-            response = self.fcm_sender(
-                title=event["title"],
-                body=event["message"],
-                data=data,
-                image_url=image_url,
+        if self.email_sender is not None:
+            filename = Path(urlsplit(event.get("image_url", "")).path).name
+            attachment_path = self.image_dir / filename if filename else None
+            response = self.email_sender(
+                event=event,
+                attachment_path=attachment_path,
             )
             if event["detection_type"] == "unknown_person":
-                sent = response.get("sent", "unknown") if isinstance(response, dict) else "unknown"
+                queued = bool(response)
                 print(
                     f"{self._camera_prefix()} [UNKNOWN] ALERT_SENT "
-                    f"| channel=fcm sent={sent}"
+                    f"| channel=email queued={queued}"
                 )
             return response
-        print("[WARNING] No FCM sender configured; notification skipped.")
+        print("[WARNING] No email sender configured; alert email not queued.")
 
     def _publish(self, event, image, notify):
         if event.get("detection_type") == "unknown_person" and not (
