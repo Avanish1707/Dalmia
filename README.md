@@ -286,7 +286,7 @@ sent through Socket.IO or the detection-event manager.
 InsightFace runs on each camera frame without a YOLO person detector or ROI
 gate. Invalid face geometry and detections below
 `FACE_RECOGNITION_MIN_DET_SCORE` (default `0.40`) are rejected. An unknown
-must also meet `UNKNOWN_FACE_MIN_SCORE` (default `0.60`) and be confirmed on
+must also meet `UNKNOWN_FACE_MIN_SCORE` (default `0.40`) and be confirmed on
 two inference frames before email is attempted.
 
 The recognition matcher deliberately holds borderline matches as `PENDING`:
