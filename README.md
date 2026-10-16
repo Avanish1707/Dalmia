@@ -34,7 +34,8 @@ app.py
 		 -> camera configuration and state initialization
 		 -> shared YOLO person model
 		 -> shared YOLO vehicle model
-		 -> one InsightFace buffalo_l instance
+		 -> one shared InsightFace buffalo_l instance with ArcFace
+		    w600k_r50 recognition for every enabled camera worker
 		 -> registered-face cache and auth accounts
 		 -> one DetectionEventManager per enabled camera
 		 -> CameraManager
@@ -67,7 +68,7 @@ compatibility files currently re-export behavior from the active monolith.
 | RTSP | `alcon_stream_new.py`, `camera/rtsp.py` | `build_rtsp_url`, `configure_h264_stream`, OpenCV capture and reconnect |
 | Camera lifecycle | `camera/manager.py` | `CameraManager`, `ManagedWorker` |
 | Frame pipeline | `alcon_stream_new.py` | `camera_worker` |
-| CPU/model execution | `alcon_stream_new.py`, `ai/models.py` | serialized CPU inference, one person YOLO, one vehicle YOLO, one FaceAnalysis |
+| CPU/model execution | `alcon_stream_new.py`, `ai/models.py` | serialized CPU inference, one person YOLO, one vehicle YOLO, shared buffalo_l/ArcFace FaceAnalysis |
 | Person detection | `alcon_stream_new.py`, `ai/person.py` | `safe_person_inference`, `detect_person_boxes` |
 | Vehicle detection | `alcon_stream_new.py`, `ai/vehicle.py` | `safe_vehicle_inference`, `detect_vehicle_boxes`, vehicle ROI and validation |
 | Face detection | `alcon_stream_new.py`, `ai/face.py` | `safe_face_inference`, InsightFace geometry checks |
@@ -104,6 +105,8 @@ camera ID, display name, NVR address, KPI, enabled flag, channel, and subtype.
 CAM001 uses the `known_unknown` KPI for annotated known/unknown person detection;
 vehicle inference is enabled only for cameras configured with the `vehicle` KPI.
 YOLO and InsightFace inference are pinned to CPU, regardless of GPU availability.
+The shared `buffalo_l` face pipeline requires its `w600k_r50.onnx` ArcFace
+recognition model and is used by all enabled camera workers.
 An optional `RTSP_URL` or `rtsp_url` is an explicit endpoint override and takes
 precedence over the NVR/channel/subtype fallback. URL credentials in the
 configuration are discarded; the worker uses `ALCON_PASSWORD` from the
@@ -256,8 +259,9 @@ exactly-one-face rule.
    is not initialized as a prerequisite for detection alerts.
 4. Enabled camera records are loaded and camera state dictionaries are created.
 5. H.264 configuration is requested from each enabled NVR using HTTP digest auth.
-6. The person YOLO model, InsightFace `buffalo_l`, and vehicle YOLO model are
-	loaded once per process.
+6. The person YOLO model, InsightFace `buffalo_l` with its ArcFace
+	`w600k_r50.onnx` recognizer, and vehicle YOLO model are loaded once per
+	process and shared by enabled camera workers.
 7. One `DetectionEventManager` is created for each enabled camera.
 8. The SQLite schema is checked without replacing the existing database.
 9. Registered face embeddings and metadata are loaded into the live cache.

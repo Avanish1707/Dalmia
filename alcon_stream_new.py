@@ -640,11 +640,26 @@ def initialize_face_model():
         name="buffalo_l",
         providers=providers
     )
+    recognition_model = face_app.models.get("recognition")
+    recognition_model_file = Path(
+        getattr(recognition_model, "model_file", "")
+    ).name.lower()
+    if recognition_model_file != "w600k_r50.onnx":
+        raise RuntimeError(
+            "The buffalo_l model pack must provide its ArcFace "
+            "w600k_r50.onnx recognition model; got "
+            f"{recognition_model_file or 'no recognition model'}."
+        )
 
     face_app.prepare(
         ctx_id=-1,
         det_size=DET_SIZE,
         det_thresh=DET_THRESH
+    )
+    print(
+        "[FACE MODEL] recognition=ArcFace "
+        f"model={recognition_model_file} "
+        f"camera_scope=all_enabled_cameras"
     )
 
     print(
@@ -654,7 +669,10 @@ def initialize_face_model():
     print("[OK] Vehicle detector loaded.")
 
     print("[OK] Face model loaded.")
-    print(f"[FACE MODEL] embedding_dimension={face_app.model.get_output_dim() if hasattr(face_app, 'model') and hasattr(face_app.model, 'get_output_dim') else 'unknown'}")
+    print(
+        "[FACE MODEL] pack=buffalo_l "
+        f"recognition=ArcFace({recognition_model_file})"
+    )
 
 
 def initialize_fall_detector():
