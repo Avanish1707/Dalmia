@@ -243,7 +243,7 @@ ALERT_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
 #
 PUBLIC_BASE_URL = os.getenv(
     "PUBLIC_BASE_URL",
-    "http://128.185.37.166:5000/"
+    "http://115.242.181.34:5000/"
 ).rstrip("/")
 
 
