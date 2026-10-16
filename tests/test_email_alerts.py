@@ -37,6 +37,32 @@ def test_email_config_is_optional_when_unconfigured(monkeypatch):
     assert EmailConfig.from_env() is None
 
 
+def test_required_email_config_fails_when_unconfigured(monkeypatch):
+    for name in (
+        "MAIL_HOST",
+        "MAIL_PORT",
+        "MAIL_USERNAME",
+        "MAIL_PASSWORD",
+        "MAIL_FROM",
+        "ALERT_EMAIL_TO",
+        "MAIL_USE_TLS",
+        "MAIL_USE_SSL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    with pytest.raises(ValueError, match="Email alerts are required"):
+        EmailConfig.require_from_env()
+
+
+def test_required_email_config_returns_config_when_configured(monkeypatch):
+    _set_mail_env(monkeypatch)
+
+    config = EmailConfig.require_from_env()
+
+    assert config.host == "smtp.example.test"
+    assert config.recipients == ("first@example.test", "second@example.test")
+
+
 def test_email_config_rejects_partial_configuration(monkeypatch):
     monkeypatch.setenv("MAIL_HOST", "smtp.example.test")
 

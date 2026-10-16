@@ -240,8 +240,9 @@ exactly-one-face rule.
 
 1. `app.py` imports `main` and calls it.
 2. `.env` is loaded and paths are resolved relative to the project directory.
-3. The bounded email worker starts when SMTP settings are configured. Firebase
-   is not initialized as a prerequisite for detection alerts.
+3. Required SMTP settings are validated and the bounded email worker starts;
+   startup fails clearly when email alerts cannot be enabled. Firebase is not
+   initialized as a prerequisite for detection alerts.
 4. Enabled camera records are loaded and camera state dictionaries are created.
 5. H.264 configuration is requested from each enabled NVR using HTTP digest auth.
 6. InsightFace `buffalo_s` is loaded with only its face detection and ArcFace
@@ -284,7 +285,8 @@ sent through Socket.IO or the detection-event manager.
 #### Why a face may not become an unknown-person detection
 
 InsightFace runs on each camera frame without a YOLO person detector or ROI
-gate. Invalid face geometry and detections below
+gate. Only unusable bounding boxes (non-finite, empty, or entirely outside
+the frame) and detections below
 `FACE_RECOGNITION_MIN_DET_SCORE` (default `0.40`) are rejected. An unknown
 must also meet `UNKNOWN_FACE_MIN_SCORE` (default `0.40`) and be confirmed on
 two inference frames before email is attempted.
@@ -300,10 +302,11 @@ decision stage for each camera.
 Unknown-person email is queued after two matching unknown-face detections.
 Configure
 `MAIL_HOST`, `MAIL_PORT`, `MAIL_FROM`, `ALERT_EMAIL_TO`, and the required
-transport/authentication values in the deployment environment. At startup,
-`[FACE-ONLY][EMAIL] stage=startup result=disabled` means no email worker was
-started. `stage=queue result=failed` means the event was not accepted by the
-queue. `[EMAIL][DELIVERY] stage=attempt` confirms SMTP delivery began;
+transport/authentication values in the deployment environment. Startup logs
+`[FACE-ONLY][EMAIL] stage=startup result=configuration_error` and stops if
+required mail settings are missing. `stage=queue result=failed` means the
+event was not accepted by the queue. `[EMAIL][DELIVERY] stage=attempt`
+confirms SMTP delivery began;
 `stage=complete result=failed` reports the SMTP error, and `result=sent`
 confirms successful delivery.
 
@@ -330,11 +333,10 @@ To enable SMTP alert delivery, configure `MAIL_HOST`, `MAIL_PORT`, `MAIL_FROM`,
 and comma-separated `ALERT_EMAIL_TO`. `MAIL_USERNAME` and `MAIL_PASSWORD` must
 be set together when authentication is required. Choose exactly one of
 `MAIL_USE_TLS` (STARTTLS) or `MAIL_USE_SSL` for the configured provider.
-Partial or invalid settings fail startup with a clear configuration error;
-when all mail settings are blank, email delivery is explicitly disabled and
-the application logs a warning. `/api/test-notification` queues a test email
-using the latest default-camera frame. Do not use real SMTP credentials in
-tests.
+Missing, partial, or invalid settings fail startup with a clear configuration
+error, so the camera workers cannot run while email alerting is unavailable.
+`/api/test-notification` queues a test email using the latest default-camera
+frame. Do not use real SMTP credentials in tests.
 
 For deployment, install the existing requirements, set PostgreSQL, camera,
 dashboard-secret, and SMTP environment values, then restart the service behind

@@ -51,7 +51,7 @@ from camera.rtsp_url import build_rtsp_url, redact_rtsp_url
 from notifications.email import EmailAlertQueue, EmailConfig
 from config.cameras import CAMERAS, enabled_cameras
 from roi.camera_rois import get_camera_roi
-from face_only import FaceOnlyUnknownTracker
+from face_only import FaceOnlyUnknownTracker, usable_face_box
 from face_association import (
     face_associated_with_person as _face_associated_with_person,
     face_box_inside_person,
@@ -2907,21 +2907,13 @@ def initialize_email_alerts():
     global email_alert_queue
 
     try:
-        config = EmailConfig.from_env()
+        config = EmailConfig.require_from_env()
     except ValueError as error:
         print(
             "[FACE-ONLY][EMAIL] stage=startup result=configuration_error "
             f"error={error}"
         )
         raise
-    if config is None:
-        email_alert_queue = None
-        print(
-            "[FACE-ONLY][EMAIL] stage=startup result=disabled "
-            "reason=mail_configuration_missing "
-            "required=MAIL_HOST,MAIL_PORT,MAIL_FROM,ALERT_EMAIL_TO"
-        )
-        return
     email_alert_queue = EmailAlertQueue(config)
     email_alert_queue.start()
     print("[FACE-ONLY][EMAIL] stage=startup result=ready")
@@ -3122,17 +3114,19 @@ def camera_worker(camera_config, rtsp_url=None):
                             detection_score = float(
                                 getattr(face, "det_score", 0.0)
                             )
-                            face_box = np.asarray(
-                                getattr(face, "bbox", []),
-                                dtype=np.float32,
-                            ).reshape(-1)
-                            if face_box.size != 4 or not is_plausible_face_detection(face):
+                            face_box, rejection_reason = usable_face_box(
+                                face,
+                                frame.shape,
+                            )
+                            if rejection_reason:
                                 _camera_log(
                                     camera_id,
-                                    f"[FACE-ONLY][REJECT] reason=invalid_face_geometry "
-                                    f"det_score={detection_score:.3f}",
+                                    f"[FACE-ONLY][REJECT] reason={rejection_reason} "
+                                    f"det_score={detection_score:.3f} "
+                                    f"bbox={getattr(face, 'bbox', None)}",
                                 )
                                 continue
+                            face.bbox = face_box
                             if detection_score < FACE_RECOGNITION_MIN_DET_SCORE:
                                 _camera_log(
                                     camera_id,

@@ -115,6 +115,17 @@ class EmailConfig:
             use_ssl=use_ssl,
         )
 
+    @classmethod
+    def require_from_env(cls):
+        """Require working mail configuration for applications that depend on alerts."""
+        config = cls.from_env()
+        if config is None:
+            raise ValueError(
+                "Email alerts are required but not configured; set "
+                "MAIL_HOST, MAIL_PORT, MAIL_FROM, and ALERT_EMAIL_TO"
+            )
+        return config
+
 
 class EmailAlertQueue:
     """Send alert messages off the camera thread with bounded work and retries."""

@@ -7,6 +7,38 @@ import math
 import numpy as np
 
 
+def usable_face_box(face, frame_shape):
+    """Return a clipped detector box, or a reason the box cannot be used."""
+    try:
+        box = np.asarray(getattr(face, "bbox", []), dtype=np.float32).reshape(-1)
+    except (TypeError, ValueError):
+        return None, "invalid_bbox"
+    if box.size != 4:
+        return None, "invalid_bbox"
+    if not np.all(np.isfinite(box)):
+        return None, "non_finite_bbox"
+
+    height, width = frame_shape[:2]
+    if height <= 0 or width <= 0:
+        return None, "invalid_frame_dimensions"
+    x1, y1, x2, y2 = box
+    if x2 <= x1 or y2 <= y1:
+        return None, "empty_bbox"
+
+    clipped = np.array(
+        [
+            np.clip(x1, 0, width - 1),
+            np.clip(y1, 0, height - 1),
+            np.clip(x2, 0, width - 1),
+            np.clip(y2, 0, height - 1),
+        ],
+        dtype=np.float32,
+    )
+    if clipped[2] <= clipped[0] or clipped[3] <= clipped[1]:
+        return None, "outside_frame"
+    return clipped, None
+
+
 class FaceOnlyUnknownTracker:
     def __init__(self, confirm_frames=2, track_timeout=5.0):
         self.confirm_frames = max(1, int(confirm_frames))
