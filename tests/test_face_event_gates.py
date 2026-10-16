@@ -77,6 +77,33 @@ def test_pending_person_exit_does_not_create_unknown_event(tmp_path):
     assert list(tmp_path.iterdir()) == []
 
 
+def test_unknown_below_face_score_gate_stays_pending(tmp_path):
+    manager, database, socket = _manager(tmp_path)
+    frame = np.zeros((80, 80, 3), dtype=np.uint8)
+    low_confidence_validation = {
+        **_valid_face_validation(),
+        "unknown_face_score_valid": False,
+    }
+    low_confidence_unknown = SimpleNamespace(
+        recognized_name="Unknown",
+        recognition_state="UNKNOWN",
+        recognition_decision="UNKNOWN",
+        face_validation=low_confidence_validation,
+        associated_person_box=np.array([10, 10, 50, 70]),
+        annotation_box=np.array([20, 15, 35, 30]),
+        recognition_score=0.1,
+        track_id=8,
+    )
+
+    manager.process_frame(frame, [low_confidence_unknown], [], "Gate 1", 1.0)
+    records = manager.process_frame(frame, [], [], "Gate 1", 2.0)
+
+    assert records == []
+    assert database.events == []
+    assert socket.events == []
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_unknown_publisher_rejects_missing_validation(tmp_path):
     manager, database, socket = _manager(tmp_path)
     event = {

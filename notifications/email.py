@@ -219,7 +219,7 @@ class EmailAlertQueue:
         message["Subject"] = subject.replace("\r", " ").replace("\n", " ")
         message["From"] = self.config.sender
         message["To"] = ", ".join(self.config.recipients)
-        message["Message-ID"] = f"<vms-alert-{job['message_id']}@wave-vms>"
+        message["Message-ID"] = f"<vms-alert-{job['message_id']}@dalmia-vms>"
         message.attach(MIMEText(self._format_body(event), "plain", "utf-8"))
 
         attachment_path = job["attachment_path"]

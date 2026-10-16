@@ -1,5 +1,5 @@
 {
-  "title": "Wave FR API Reference",
+  "title": "Dalmia FR API Reference",
   "version": "1.0",
   "base_url": "http://<server-ip>:5000",
   "api_base_url": "http://<server-ip>:5000/api",

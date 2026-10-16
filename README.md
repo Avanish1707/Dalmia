@@ -1,6 +1,6 @@
 # ALCON Surveillance Backend
 
-Wave VMS is a Flask and Socket.IO surveillance service. It reads NVR RTSP
+Dalmia VMS is a Flask and Socket.IO surveillance service. It reads NVR RTSP
 streams, runs shared YOLO and InsightFace models, associates faces with
 person detections, recognizes registered employees, tracks ROI visits, saves
 finalized detection events, sends alert emails asynchronously, and provides
@@ -125,7 +125,7 @@ rejected. `config/cameras.py` is now the owner of this loading behavior.
 
 ### Windows RTSP diagnostics
 
-Run these checks from PowerShell on the WAVE host. A TCP success only confirms
+Run these checks from PowerShell on the Dalmia host. A TCP success only confirms
 reachability to the RTSP port; it does not validate credentials or the stream
 path.
 
@@ -299,6 +299,28 @@ ROI. Events are finalized on confirmed exits, use the configured historical
 frame offset for the image, and are written through `DetectionDatabase`.
 Unknown groups are held until the last member exits. Alert deduplication,
 unknown presence timing, and vehicle context remain camera-aware.
+
+#### Why a face may not become an unknown-person detection
+
+Face detection and unknown classification are separate stages. A person must
+first be detected by YOLO inside that camera's configured person ROI; then
+InsightFace must return a plausible face associated with that same person
+track, with at least two temporal confirmations. Faces below
+`FACE_RECOGNITION_MIN_DET_SCORE` (default `0.40`) are rejected. Even an
+accepted face is only eligible as an unknown when its face detector score is
+at least `UNKNOWN_FACE_MIN_SCORE` (default `0.60`) and all person/ROI/face
+validation gates pass.
+
+The recognition matcher also deliberately holds borderline matches as
+`PENDING`: candidate similarity at/above `RECOGNITION_CANDIDATE_THRESHOLD`
+(default `0.43`) that fails the known threshold (`0.50`) or margin (`0.05`)
+does not become an unknown alert. This avoids incorrectly alerting on a
+possible registered person. Logs show `[FACE] REJECTED`, `[FACE] CANDIDATE`,
+`[FACE] UNKNOWN`, and `[UNKNOWN COUNT]`; a confirmed detection event is
+persisted and alerted only after the tracked person exits the ROI and that
+exit is confirmed. Check those lines by camera ID to identify the specific
+gate preventing an unknown event. Do not lower thresholds without validating
+false-positive rates on representative camera footage.
 
 Finalized events emit `detection_event`. Person alerts are appended to the
 bounded in-memory `alert_history` and emitted as `face_alert`. Configured

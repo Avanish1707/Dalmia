@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>WAVE VMS Camera Dashboard</title>
+  <title>Dalmia VMS Camera Dashboard</title>
   <style>
     :root { color-scheme: dark; font-family: Segoe UI, Arial, sans-serif; background: #0b1220; color: #e5e7eb; }
     body { margin: 0; }
@@ -34,7 +34,7 @@
 </head>
 <body>
   <header>
-    <div><h1>WAVE VMS Camera Dashboard</h1><span>Signed in as {{ dashboard_user.username }}</span></div>
+    <div><h1>Dalmia VMS Camera Dashboard</h1><span>Signed in as {{ dashboard_user.username }}</span></div>
     <form action="{{ url_for('dashboard_logout') }}" method="post"><button type="submit">Sign out</button></form>
   </header>
   <main>

@@ -4133,6 +4133,42 @@ def camera_worker(camera_config, rtsp_url=None):
                             face_detection_score = float(
                                 getattr(face, "det_score", 0.0)
                             )
+                            recognition_decision = getattr(
+                                face, "recognition_decision", None
+                            )
+                            if recognition_decision == "PENDING":
+                                unknown_gate_status = "HELD_AMBIGUOUS_KNOWN_MATCH"
+                            elif name == "Unknown" and not unknown_face_valid:
+                                if face_detection_score < UNKNOWN_FACE_MIN_SCORE:
+                                    unknown_gate_status = "REJECTED_LOW_FACE_SCORE"
+                                else:
+                                    unknown_gate_status = "REJECTED_VALIDATION"
+                            elif name == "Unknown" and unknown_face_valid:
+                                unknown_gate_status = "ACCEPTED"
+                            else:
+                                unknown_gate_status = "KNOWN"
+
+                            if (
+                                person_track.get("unknown_gate_diagnostic")
+                                != unknown_gate_status
+                            ):
+                                person_track["unknown_gate_diagnostic"] = (
+                                    unknown_gate_status
+                                )
+                                if unknown_gate_status != "KNOWN":
+                                    _camera_log(
+                                        camera_id,
+                                        f"[UNKNOWN GATE] track={person_track['track_id']} "
+                                        f"result={unknown_gate_status} "
+                                        f"decision={recognition_decision} "
+                                        f"face_det_score={face_detection_score:.3f}/"
+                                        f"{UNKNOWN_FACE_MIN_SCORE:.3f} "
+                                        f"similarity={score:.3f} "
+                                        f"candidate_threshold="
+                                        f"{RECOGNITION_CANDIDATE_THRESHOLD:.3f} "
+                                        f"known_threshold={RECOGNITION_THRESHOLD:.3f} "
+                                        f"margin_required={RECOGNITION_MARGIN:.3f}",
+                                    )
 
 
                             if (
@@ -6276,6 +6312,14 @@ def main():
 
     initialize_email_alerts()
     initialize_camera_states()
+    print(
+        "[INFO][FACE GATES] "
+        f"known_threshold={RECOGNITION_THRESHOLD:.2f} "
+        f"candidate_threshold={RECOGNITION_CANDIDATE_THRESHOLD:.2f} "
+        f"margin={RECOGNITION_MARGIN:.2f} "
+        f"min_face_score={FACE_RECOGNITION_MIN_DET_SCORE:.2f} "
+        f"unknown_face_score={UNKNOWN_FACE_MIN_SCORE:.2f}"
+    )
 
 
     # ----------------------------------------

@@ -1,4 +1,4 @@
-"""Independent posture analysis for the Wave VMS fall-detection KPI."""
+"""Independent posture analysis for the Dalmia VMS fall-detection KPI."""
 
 from .fall_detector import FallDetector, FallEvent
 
