@@ -160,11 +160,19 @@
     },
     {
       "method": "POST",
-      "path": "/api/test-notification",
-      "purpose": "Sends a manual test person notification using the default camera's latest frame.",
+      "path": "/api/test-email",
+      "purpose": "Queues an authenticated manual test email using the default camera's latest frame.",
       "request": {"body": null},
-      "success": {"status": 200, "body": {"success": true, "message": "Test notification sent"}},
-      "errors": [503]
+      "success": {"status": 202, "body": {"success": true, "message": "Test email job queued; SMTP submission is pending.", "correlation_id": "uuid", "event_id": "uuid"}},
+      "errors": [401, 503]
+    },
+    {
+      "method": "POST",
+      "path": "/api/test-notification",
+      "purpose": "Backward-compatible alias for the authenticated test email endpoint.",
+      "request": {"body": null},
+      "success": {"status": 202, "body": {"success": true, "message": "Test email job queued; SMTP submission is pending.", "correlation_id": "uuid", "event_id": "uuid"}},
+      "errors": [401, 503]
     },
     {
       "method": "GET",

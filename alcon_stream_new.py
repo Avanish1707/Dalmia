@@ -41,7 +41,8 @@ from dotenv import load_dotenv
 
 # Load deployment switches before importing camera and KPI configuration
 # modules, which read their values at module initialization time.
-load_dotenv(Path(__file__).resolve().parent / ".env")
+DOTENV_PATH = Path(__file__).resolve().parent / ".env"
+load_dotenv(DOTENV_PATH, override=False)
 
 from database import validate_postgres_connection
 from insightface.app import FaceAnalysis
@@ -2905,7 +2906,8 @@ def _queue_email_alert(event, attachment_path=None):
     if email_alert_queue is None:
         print(
             "[FACE-ONLY][EMAIL] stage=queue result=failed "
-            "reason=email_worker_not_configured"
+            f"reason=email_worker_not_configured "
+            f"correlation_id={event.get('correlation_id', 'unknown')}"
         )
         return False
     return email_alert_queue.submit(event, attachment_path=attachment_path)
@@ -2914,6 +2916,16 @@ def _queue_email_alert(event, attachment_path=None):
 def initialize_email_alerts():
     global email_alert_queue
 
+    presence = EmailConfig.environment_presence()
+    print(
+        "[EMAIL][CONFIG] "
+        + " ".join(
+            f"{name}={'present' if is_present else 'missing'}"
+            for name, is_present in presence.items()
+        )
+        + f" dotenv_path={DOTENV_PATH} "
+        + f"dotenv_file={'present' if DOTENV_PATH.is_file() else 'missing'}"
+    )
     try:
         config = EmailConfig.require_from_env()
     except ValueError as error:
@@ -2921,49 +2933,108 @@ def initialize_email_alerts():
             "[FACE-ONLY][EMAIL] stage=startup result=configuration_error "
             f"error={error}"
         )
-        raise
-    email_alert_queue = EmailAlertQueue(config)
-    email_alert_queue.start()
-    print("[FACE-ONLY][EMAIL] stage=startup result=ready")
-
-
-def _send_face_only_unknown_email(camera_id, camera_name, face, score, frame):
-    try:
-        notification_id, image_url = save_alert_image(frame)
-    except Exception as error:
-        print(
-            f"[FACE-ONLY][EMAIL] camera={camera_id} stage=evidence "
-            f"result=failed error_type={type(error).__name__}"
-        )
+        email_alert_queue = None
         return False
+    email_alert_queue = EmailAlertQueue(config)
+    try:
+        email_alert_queue.start()
+    except (OSError, RuntimeError) as error:
+        print(
+            "[FACE-ONLY][EMAIL] stage=startup result=worker_error "
+            f"error_type={type(error).__name__}"
+        )
+        email_alert_queue = None
+        return False
+    print(
+        "[FACE-ONLY][EMAIL] stage=startup result=ready "
+        f"host={config.host} port={config.port} "
+        f"transport={'ssl' if config.use_ssl else 'starttls' if config.use_tls else 'plain'} "
+        f"recipient_count={len(config.recipients)}"
+    )
+    return True
 
-    event = {
-        "id": notification_id,
-        "title": "Unknown Person Detected",
-        "message": f"Unknown person detected by face recognition at {camera_name}",
-        "detection_type": "unknown_person",
-        "recognition_state": "UNKNOWN",
-        "person_name": "Unknown",
-        "confidence": float(score),
-        "face_detection_score": float(getattr(face, "det_score", 0.0)),
-        "camera_id": camera_id,
-        "camera_name": camera_name,
-        "gate_name": camera_name,
-        "detected_at": time.time(),
-        "image_url": image_url,
-    }
-    attachment_path = ALERT_IMAGE_DIR / Path(urlsplit(image_url).path).name
+
+def _send_face_only_unknown_email(
+    camera_id,
+    camera_name,
+    face,
+    score,
+    frame,
+    track=None,
+):
+    if track is None:
+        track = {}
+    event = track.get("email_event")
+    attachment_path = track.get("email_attachment_path")
+    if event is None:
+        correlation_id = uuid.uuid4().hex
+        try:
+            notification_id, image_url = save_alert_image(frame)
+            attachment_path = ALERT_IMAGE_DIR / Path(urlsplit(image_url).path).name
+        except Exception as error:
+            image_url = ""
+            attachment_path = None
+            print(
+                f"[FACE-ONLY][EMAIL] camera={camera_id} "
+                f"stage=evidence result=failed "
+                f"correlation_id={correlation_id} "
+                f"error_type={type(error).__name__}"
+            )
+            notification_id = correlation_id
+
+        event = {
+            "id": notification_id,
+            "correlation_id": correlation_id,
+            "title": "Unknown Person Detected",
+            "message": f"Unknown person detected by face recognition at {camera_name}",
+            "detection_type": "unknown_person",
+            "recognition_state": "UNKNOWN",
+            "person_name": "Unknown",
+            "confidence": float(score),
+            "face_detection_score": float(getattr(face, "det_score", 0.0)),
+            "camera_id": camera_id,
+            "camera_name": camera_name,
+            "gate_name": camera_name,
+            "detected_at": time.time(),
+            "image_url": image_url,
+        }
+        track["email_event"] = event
+        track["email_attachment_path"] = attachment_path
+        track["event_persisted"] = False
+
+    if not track.get("event_persisted", False):
+        try:
+            persisted_id = detection_database.save(event)
+            if persisted_id is not None:
+                event["id"] = persisted_id
+            track["event_persisted"] = True
+            print(
+                f"[FACE-ONLY][EVENT] camera={camera_id} "
+                "stage=persistence result=saved "
+                f"event_id={event['id']} "
+                f"correlation_id={event['correlation_id']}"
+            )
+        except Exception as error:
+            print(
+                f"[FACE-ONLY][EVENT] camera={camera_id} "
+                "stage=persistence result=failed "
+                f"correlation_id={event['correlation_id']} "
+                f"error_type={type(error).__name__}"
+            )
+
     try:
         queued = _queue_email_alert(event, attachment_path=attachment_path)
     except Exception as error:
         print(
             f"[FACE-ONLY][EMAIL] camera={camera_id} stage=queue "
-            f"result=error error_type={type(error).__name__}"
+            f"result=error correlation_id={event['correlation_id']} "
+            f"error_type={type(error).__name__}"
         )
         return False
     print(
         f"[FACE-ONLY][EMAIL] camera={camera_id} stage=queue "
-        f"result={'queued' if queued else 'failed'} event_id={event['id']}"
+        f"result={'queued' if queued else 'failed'} event_id={event['id']} "
+        f"correlation_id={event['correlation_id']}"
     )
     return queued
 
@@ -3226,6 +3297,7 @@ def camera_worker(camera_config, rtsp_url=None):
                                 face,
                                 recognition_score,
                                 alert_frame,
+                                track=track,
                             )
                             track["email_attempted"] = (
                                 queued or email_alert_queue is None
@@ -4698,66 +4770,124 @@ def api_snapshot():
 # ============================================================
 
 @app.route(
+    "/api/test-email",
+    methods=["POST"]
+)
+@app.route(
     "/api/test-notification",
     methods=["POST"]
 )
 def test_notification():
+    correlation_id = uuid.uuid4().hex
+    if not app.secret_key:
+        app.logger.error(
+            "[EMAIL][TEST] result=unavailable "
+            f"correlation_id={correlation_id} reason=dashboard_auth_not_configured"
+        )
+        return jsonify({
+            "success": False,
+            "error": "Dashboard authentication is not configured.",
+            "correlation_id": correlation_id,
+        }), 503
+    if not session.get("dashboard_user"):
+        app.logger.warning(
+            "[EMAIL][TEST] result=unauthorized "
+            f"correlation_id={correlation_id}"
+        )
+        return jsonify({
+            "success": False,
+            "error": "Dashboard authentication required.",
+            "correlation_id": correlation_id,
+        }), 401
+    if email_alert_queue is None:
+        app.logger.error(
+            "[EMAIL][TEST] result=unavailable "
+            f"correlation_id={correlation_id} reason=email_worker_not_configured"
+        )
+        return jsonify({
+            "success": False,
+            "error": "Email service is not configured.",
+            "correlation_id": correlation_id,
+        }), 503
+
     default_camera = _default_camera()
     snapshot = _camera_snapshot(default_camera["camera_id"])
     frame = snapshot["frame"] if snapshot else None
 
-
     if frame is None:
-
-        return jsonify(
-            {
-                "success": False,
-                "error":
-                    "No camera frame available"
-            }
-        ), 503
-
+        app.logger.warning(
+            "[EMAIL][TEST] result=unavailable "
+            f"correlation_id={correlation_id} reason=no_camera_frame"
+        )
+        return jsonify({
+            "success": False,
+            "error": "No camera frame is available.",
+            "correlation_id": correlation_id,
+        }), 503
 
     try:
         notification_id, image_url = save_alert_image(frame)
     except Exception as error:
-        print(
-            "[FACE-ONLY][EMAIL] stage=test_evidence result=failed "
+        app.logger.error(
+            "[EMAIL][TEST] stage=evidence result=failed "
+            f"correlation_id={correlation_id} "
             f"error_type={type(error).__name__}"
         )
         return jsonify({
             "success": False,
             "error": "Test evidence image could not be saved.",
+            "correlation_id": correlation_id,
         }), 500
 
     attachment_path = ALERT_IMAGE_DIR / Path(urlsplit(image_url).path).name
-    queued = _queue_email_alert(
-        {
-            "id": notification_id,
-            "title": "Email Delivery Test",
-            "message": f"Manual email delivery test for {default_camera['name']}",
-            "detection_type": "email_test",
-            "camera_id": default_camera["camera_id"],
-            "camera_name": default_camera["name"],
-            "detected_at": time.time(),
-            "image_url": image_url,
-        },
-        attachment_path=attachment_path,
-    )
-
-    if not queued:
+    try:
+        queued = _queue_email_alert(
+            {
+                "id": notification_id,
+                "correlation_id": correlation_id,
+                "title": "Email Delivery Test",
+                "message": f"Manual email delivery test for {default_camera['name']}",
+                "detection_type": "email_test",
+                "camera_id": default_camera["camera_id"],
+                "camera_name": default_camera["name"],
+                "detected_at": time.time(),
+                "image_url": image_url,
+            },
+            attachment_path=attachment_path,
+        )
+    except Exception as error:
+        app.logger.error(
+            "[EMAIL][TEST] stage=queue result=error "
+            f"correlation_id={correlation_id} "
+            f"error_type={type(error).__name__}"
+        )
         return jsonify({
             "success": False,
-            "error": "Email alert was not queued; check email configuration and worker status.",
+            "error": "Email job could not be queued.",
+            "correlation_id": correlation_id,
         }), 503
 
-    return jsonify(
-        {
-            "success": True,
-            "message":
-                "Test email alert queued"
-        }
+    if not queued:
+        app.logger.error(
+            "[EMAIL][TEST] result=not_queued "
+            f"correlation_id={correlation_id}"
+        )
+        return jsonify({
+            "success": False,
+            "error": "Email job was not queued; check server email logs.",
+            "correlation_id": correlation_id,
+        }), 503
+
+    app.logger.info(
+        "[EMAIL][TEST] result=queued "
+        f"event_id={notification_id} correlation_id={correlation_id}"
     )
+    return jsonify({
+        "success": True,
+        "message": "Test email job queued; SMTP submission is pending.",
+        "correlation_id": correlation_id,
+        "event_id": notification_id,
+    }), 202
 
 
 # ============================================================

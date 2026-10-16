@@ -38,6 +38,23 @@ class EmailConfig:
     timeout: float = 10.0
 
     @classmethod
+    def environment_presence(cls):
+        names = (
+            "MAIL_HOST",
+            "MAIL_PORT",
+            "MAIL_USERNAME",
+            "MAIL_PASSWORD",
+            "MAIL_FROM",
+            "ALERT_EMAIL_TO",
+            "MAIL_USE_TLS",
+            "MAIL_USE_SSL",
+        )
+        return {
+            name: bool(os.getenv(name, "").strip())
+            for name in names
+        }
+
+    @classmethod
     def from_env(cls):
         names = (
             "MAIL_HOST",
@@ -62,7 +79,14 @@ class EmailConfig:
                 )
             return None
 
-        required = ("MAIL_HOST", "MAIL_PORT", "MAIL_FROM", "ALERT_EMAIL_TO")
+        required = (
+            "MAIL_HOST",
+            "MAIL_PORT",
+            "MAIL_USERNAME",
+            "MAIL_PASSWORD",
+            "MAIL_FROM",
+            "ALERT_EMAIL_TO",
+        )
         missing = [name for name in required if not configured[name]]
         if missing:
             raise ValueError(
@@ -122,7 +146,8 @@ class EmailConfig:
         if config is None:
             raise ValueError(
                 "Email alerts are required but not configured; set "
-                "MAIL_HOST, MAIL_PORT, MAIL_FROM, and ALERT_EMAIL_TO"
+                "MAIL_HOST, MAIL_PORT, MAIL_USERNAME, MAIL_PASSWORD, "
+                "MAIL_FROM, and ALERT_EMAIL_TO"
             )
         return config
 
@@ -161,6 +186,7 @@ class EmailAlertQueue:
             print(
                 "[EMAIL][QUEUE] result=failed "
                 f"event_id={event.get('id', 'unknown')} "
+                f"correlation_id={event.get('correlation_id', 'unknown')} "
                 "reason=worker_not_running"
             )
             return False
@@ -178,12 +204,15 @@ class EmailAlertQueue:
         except queue.Full:
             print(
                 "[EMAIL][QUEUE] result=failed "
-                f"event_id={event.get('id', 'unknown')} reason=queue_full"
+                f"event_id={event.get('id', 'unknown')} "
+                f"correlation_id={event.get('correlation_id', 'unknown')} "
+                "reason=queue_full"
             )
             return False
         print(
             "[EMAIL][QUEUE] result=accepted "
             f"event_id={event.get('id', 'unknown')} "
+            f"correlation_id={event.get('correlation_id', 'unknown')} "
             f"recipients={len(job['pending_recipients'])}"
         )
         return True
@@ -217,6 +246,7 @@ class EmailAlertQueue:
         for sensitive_value in (
             self.config.username,
             self.config.password,
+            os.getenv("FLASK_SECRET_KEY", ""),
         ):
             if sensitive_value:
                 detail = detail.replace(sensitive_value, "[redacted]")
@@ -237,23 +267,34 @@ class EmailAlertQueue:
                 print(
                     "[EMAIL][DELIVERY] stage=attempt "
                     f"event_id={event_id} attempt={attempt}/{self.max_attempts} "
+                    f"correlation_id={event.get('correlation_id', 'unknown')} "
                     f"host={self.config.host} port={self.config.port} "
                     f"transport={transport} "
                     f"recipients={len(job['pending_recipients'])}"
                 )
                 self._send(job)
                 print(
-                    f"[EMAIL][DELIVERY] stage=complete result=sent "
-                    f"event_id={event_id}"
+                    "[EMAIL][DELIVERY] stage=complete result=smtp_accepted "
+                    f"event_id={event_id} "
+                    f"correlation_id={event.get('correlation_id', 'unknown')}"
                 )
                 return
             except Exception as error:
                 print(
                     "[EMAIL][DELIVERY] stage=complete result=failed "
                     f"event_id={event_id} attempt={attempt}/{self.max_attempts} "
+                    f"correlation_id={event.get('correlation_id', 'unknown')} "
                     f"error_type={type(error).__name__} "
                     f"detail={self._safe_error_detail(error)}"
                 )
+                if isinstance(
+                    error,
+                    (
+                        smtplib.SMTPAuthenticationError,
+                        smtplib.SMTPRecipientsRefused,
+                    ),
+                ):
+                    return
                 if attempt < self.max_attempts:
                     time.sleep(min(2 ** (attempt - 1), 4))
 

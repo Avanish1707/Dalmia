@@ -1,4 +1,5 @@
 import threading
+import smtplib
 from email import message_from_string
 
 import pytest
@@ -80,7 +81,43 @@ def test_email_config_parses_multiple_recipients_and_transport(monkeypatch):
     assert config.use_ssl is False
 
 
-def test_email_queue_sends_event_and_snapshot_off_worker_thread(tmp_path, monkeypatch):
+def test_email_config_rejects_both_tls_modes(monkeypatch):
+    _set_mail_env(monkeypatch)
+    monkeypatch.setenv("MAIL_USE_SSL", "true")
+
+    with pytest.raises(ValueError, match="cannot both be true"):
+        EmailConfig.from_env()
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "error"),
+    [
+        ("MAIL_PORT", "not-a-port", "MAIL_PORT must be an integer"),
+        ("MAIL_USE_TLS", "sometimes", "MAIL_USE_TLS must be true or false"),
+    ],
+)
+def test_email_config_rejects_invalid_values(monkeypatch, name, value, error):
+    _set_mail_env(monkeypatch)
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(ValueError, match=error):
+        EmailConfig.from_env()
+
+
+def test_email_config_reports_only_environment_presence(monkeypatch):
+    _set_mail_env(monkeypatch)
+
+    presence = EmailConfig.environment_presence()
+
+    assert all(presence.values())
+    assert "test-only" not in repr(presence)
+
+
+def test_email_queue_sends_event_and_snapshot_off_worker_thread(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
     _set_mail_env(monkeypatch)
     config = EmailConfig.from_env()
     attachment = tmp_path / "evidence.jpg"
@@ -138,6 +175,7 @@ def test_email_queue_sends_event_and_snapshot_off_worker_thread(tmp_path, monkey
     assert "Evidence: https://example.test/alerts/evidence.jpg" in body
     assert attachment_part.get_filename() == "evidence.jpg"
     assert thread_ids[0] != camera_thread_id
+    assert "stage=complete result=smtp_accepted" in capsys.readouterr().out
 
 
 def test_email_retry_only_retries_refused_recipients(monkeypatch):
@@ -221,4 +259,54 @@ def test_email_delivery_failure_logs_stage_and_redacts_credentials(
     assert "[EMAIL][DELIVERY] stage=attempt" in output
     assert "[EMAIL][DELIVERY] stage=complete result=failed" in output
     assert "connection failed for [redacted]" in output
+    assert config.password not in output
+
+
+def test_smtp_authentication_error_is_logged_and_not_retried(
+    monkeypatch,
+    capsys,
+):
+    _set_mail_env(monkeypatch)
+    config = EmailConfig.from_env()
+    attempts = []
+
+    class AuthenticationFailureSMTP:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def starttls(self):
+            pass
+
+        def login(self, *_):
+            attempts.append("login")
+            raise smtplib.SMTPAuthenticationError(
+                535,
+                f"authentication rejected {config.password}".encode(),
+            )
+
+    queue = EmailAlertQueue(
+        config,
+        max_attempts=3,
+        smtp_factory=AuthenticationFailureSMTP,
+    )
+    queue._deliver_with_retries(
+        {
+            "event": {"id": "event-2", "correlation_id": "correlation-2"},
+            "attachment_path": None,
+            "pending_recipients": list(config.recipients),
+            "message_id": "message-2",
+        }
+    )
+
+    output = capsys.readouterr().out
+    assert attempts == ["login"]
+    assert "error_type=SMTPAuthenticationError" in output
+    assert "correlation_id=correlation-2" in output
+    assert "[redacted]" in output
     assert config.password not in output

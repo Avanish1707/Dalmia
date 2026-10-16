@@ -14,7 +14,7 @@ current face-only camera path.
 Use the project virtual environment on Windows:
 
 ```powershell
-.\.venv\Scripts\python.exe app.py
+.\venv\Scripts\python.exe app.py
 ```
 
 The server listens on `0.0.0.0:5000` by default. `python app.py` imports the
@@ -240,15 +240,17 @@ exactly-one-face rule.
 
 1. `app.py` imports `main` and calls it.
 2. `.env` is loaded and paths are resolved relative to the project directory.
-3. Required SMTP settings are validated and the bounded email worker starts;
-   startup fails clearly when email alerts cannot be enabled. Firebase is not
-   initialized as a prerequisite for detection alerts.
+3. SMTP settings are validated without logging values; a bounded email worker
+   starts when valid, while invalid settings are logged and leave inference
+   available without the email service. Firebase is not initialized as a
+   prerequisite for detection alerts.
 4. Enabled camera records are loaded and camera state dictionaries are created.
 5. H.264 configuration is requested from each enabled NVR using HTTP digest auth.
 6. InsightFace `buffalo_s` is loaded with only its face detection and ArcFace
 	`w600k_mbf.onnx` recognition modules, then shared by enabled cameras.
 7. Other detector models and `DetectionEventManager` are not initialized.
-8. The SQLite schema is checked without replacing the existing database.
+8. PostgreSQL connection and application schemas are checked through the
+   configured database connection.
 9. Registered face embeddings and metadata are loaded into the live cache.
 10. Default admin/user accounts are inserted only when absent.
 11. `CameraManager` starts one daemon worker per enabled camera.
@@ -306,12 +308,14 @@ are logged separately.
 Configure
 `MAIL_HOST`, `MAIL_PORT`, `MAIL_FROM`, `ALERT_EMAIL_TO`, and the required
 transport/authentication values in the deployment environment. Startup logs
-`[FACE-ONLY][EMAIL] stage=startup result=configuration_error` and stops if
-required mail settings are missing. `stage=queue result=failed` means the
+field presence only (never values); if mail configuration is invalid, camera
+inference and Flask remain available while email jobs are rejected with a
+clear service-unavailable response. `stage=queue result=failed` means the
 event was not accepted by the queue. `[EMAIL][DELIVERY] stage=attempt`
-confirms SMTP delivery began;
-`stage=complete result=failed` reports the SMTP error, and `result=sent`
-confirms successful delivery.
+confirms SMTP delivery began; `stage=complete result=failed` reports the
+sanitized SMTP error, and `result=smtp_accepted` means the configured SMTP
+server accepted the submission, not that delivery to the recipient's inbox
+was verified.
 
 Only confirmed unknown-face detections from the camera worker are sent through
 the detection email queue. They do not emit `face_alert` or
@@ -334,12 +338,16 @@ camera does not block other feeds.
 
 To enable SMTP alert delivery, configure `MAIL_HOST`, `MAIL_PORT`, `MAIL_FROM`,
 and comma-separated `ALERT_EMAIL_TO`. `MAIL_USERNAME` and `MAIL_PASSWORD` must
-be set together when authentication is required. Choose exactly one of
+both be set for authenticated SMTP. For Gmail, use a Google App Password,
+not the account's regular password. Choose exactly one of
 `MAIL_USE_TLS` (STARTTLS) or `MAIL_USE_SSL` for the configured provider.
-Missing, partial, or invalid settings fail startup with a clear configuration
-error, so the camera workers cannot run while email alerting is unavailable.
-`/api/test-notification` queues a test email using the latest default-camera
-frame. Do not use real SMTP credentials in tests.
+Missing, partial, or invalid settings are reported safely at startup and keep
+the email queue unavailable without stopping camera inference.
+`POST /api/test-email` (or its backward-compatible `/api/test-notification`
+alias) requires an authenticated dashboard session and returns `202` only
+when the latest default-camera frame's test email has been queued. The response
+includes a correlation ID for tracing the SMTP attempt. Do not use real SMTP
+credentials in tests.
 
 For deployment, install the existing requirements, set PostgreSQL, camera,
 dashboard-secret, and SMTP environment values, then restart the service behind
@@ -376,7 +384,8 @@ codes, and response shapes are compatibility contracts.
 | GET | `/api/alerts` | Return in-memory alert history |
 | GET | `/api/detections` | Return persisted detection events |
 | GET | `/api/snapshot` | Return the latest selected-camera JPEG as base64 |
-| POST | `/api/test-notification` | Queue a test email alert using the latest default-camera frame |
+| POST | `/api/test-email` | Authenticated test email; returns `202` only after queue acceptance |
+| POST | `/api/test-notification` | Backward-compatible alias for the authenticated test email |
 | GET | `/dashboard/login` | Sign in to the browser dashboard using an existing VMS account |
 | POST | `/dashboard/login` | Authenticate an existing account for the browser dashboard |
 | GET | `/dashboard` | Authenticated multi-camera dashboard |
