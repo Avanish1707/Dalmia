@@ -246,6 +246,8 @@ class EmailAlertQueue:
         for sensitive_value in (
             self.config.username,
             self.config.password,
+            self.config.sender,
+            *self.config.recipients,
             os.getenv("FLASK_SECRET_KEY", ""),
         ):
             if sensitive_value:
@@ -257,6 +259,7 @@ class EmailAlertQueue:
         event_id = event.get("id", "unknown")
         for attempt in range(1, self.max_attempts + 1):
             try:
+                job["attempt"] = attempt
                 transport = (
                     "ssl"
                     if self.config.use_ssl
@@ -298,83 +301,159 @@ class EmailAlertQueue:
                 if attempt < self.max_attempts:
                     time.sleep(min(2 ** (attempt - 1), 4))
 
+    @staticmethod
+    def _log_delivery_stage(job, stage, result, **details):
+        event = job["event"]
+        detail_text = " ".join(
+            f"{name}={value}" for name, value in details.items()
+        )
+        attempt = job.get("attempt")
+        attempt_text = f"attempt={attempt} " if attempt is not None else ""
+        print(
+            f"[EMAIL][DELIVERY] stage={stage} result={result} "
+            f"event_id={event.get('id', 'unknown')} "
+            f"correlation_id={event.get('correlation_id', 'unknown')} "
+            f"{attempt_text}"
+            f"{detail_text}".rstrip()
+        )
+
     def _send(self, job):
         event = job["event"]
-        title = str(event.get("title") or event.get("detection_type") or "VMS alert")
-        camera = str(event.get("camera_name") or event.get("gate_name") or "Unknown camera")
-        subject = f"{title} - {camera}"
-        message = MIMEMultipart()
-        message["Subject"] = subject.replace("\r", " ").replace("\n", " ")
-        message["From"] = self.config.sender
-        message["To"] = ", ".join(self.config.recipients)
-        message["Message-ID"] = f"<vms-alert-{job['message_id']}@dalmia-vms>"
-        message.attach(MIMEText(self._format_body(event), "plain", "utf-8"))
+        stage = "message_build"
+        try:
+            title = str(event.get("title") or event.get("detection_type") or "VMS alert")
+            camera = str(event.get("camera_name") or event.get("gate_name") or "Unknown camera")
+            subject = f"{title} - {camera}"
+            message = MIMEMultipart()
+            message["Subject"] = subject.replace("\r", " ").replace("\n", " ")
+            message["From"] = self.config.sender
+            message["To"] = ", ".join(self.config.recipients)
+            message["Message-ID"] = f"<vms-alert-{job['message_id']}@dalmia-vms>"
+            message.attach(MIMEText(self._format_body(event), "plain", "utf-8"))
 
-        attachment_path = job["attachment_path"]
-        if attachment_path is not None and attachment_path.is_file():
-            with attachment_path.open("rb") as evidence:
-                attachment = MIMEApplication(evidence.read(), _subtype="jpeg")
-            attachment.add_header(
-                "Content-Disposition",
-                "attachment",
-                filename=attachment_path.name,
+            attachment_path = job["attachment_path"]
+            attachment_result = "none"
+            if attachment_path is not None and attachment_path.is_file():
+                with attachment_path.open("rb") as evidence:
+                    attachment = MIMEApplication(evidence.read(), _subtype="jpeg")
+                attachment.add_header(
+                    "Content-Disposition",
+                    "attachment",
+                    filename=attachment_path.name,
+                )
+                message.attach(attachment)
+                attachment_result = "attached"
+            elif attachment_path is not None:
+                attachment_result = "unavailable"
+                print(
+                    "[WARNING] Email alert evidence file unavailable; "
+                    f"event_id={event.get('id', 'unknown')}"
+                )
+            self._log_delivery_stage(
+                job, stage, "complete", attachment=attachment_result
             )
-            message.attach(attachment)
-        elif attachment_path is not None:
-            print(
-                "[WARNING] Email alert evidence file unavailable; "
-                f"event_id={event.get('id', 'unknown')}"
+
+            if self._smtp_factory is not None:
+                smtp_client = self._smtp_factory
+            elif self.config.use_ssl:
+                smtp_client = smtplib.SMTP_SSL
+            else:
+                smtp_client = smtplib.SMTP
+
+            stage = "smtp_connect"
+            self._log_delivery_stage(
+                job, stage, "started",
+                host=self.config.host, port=self.config.port,
             )
-
-        if self._smtp_factory is not None:
-            smtp_client = self._smtp_factory
-        elif self.config.use_ssl:
-            smtp_client = smtplib.SMTP_SSL
-        else:
-            smtp_client = smtplib.SMTP
-
-        with smtp_client(
-            self.config.host,
-            self.config.port,
-            timeout=self.config.timeout,
-        ) as smtp:
-            if self.config.use_tls:
-                smtp.starttls()
-            if self.config.username:
-                smtp.login(self.config.username, self.config.password)
-            failed_recipients = []
-            for recipient in job["pending_recipients"]:
-                try:
-                    refused = smtp.sendmail(
-                        self.config.sender,
-                        [recipient],
-                        message.as_string(),
-                    )
-                except (OSError, smtplib.SMTPException) as error:
-                    print(
-                        "[EMAIL][RECIPIENT] result=failed "
-                        f"event_id={event.get('id', 'unknown')} "
-                        f"error_type={type(error).__name__} "
-                        f"detail={self._safe_error_detail(error)}"
-                    )
-                    failed_recipients.append(recipient)
-                    continue
-                if refused:
-                    status = refused.get(recipient, (None, b""))[0]
-                    response = refused.get(recipient, (None, b""))[1]
-                    failed_recipients.append(recipient)
-                    print(
-                        "[EMAIL][RECIPIENT] result=refused "
-                        f"event_id={event.get('id', 'unknown')} "
-                        f"smtp_status={status} "
-                        f"detail={self._safe_error_detail(Exception(response))}"
+            with smtp_client(
+                self.config.host,
+                self.config.port,
+                timeout=self.config.timeout,
+            ) as smtp:
+                self._log_delivery_stage(job, stage, "complete")
+                if self.config.use_tls:
+                    stage = "starttls"
+                    self._log_delivery_stage(job, stage, "started")
+                    smtp.starttls()
+                    self._log_delivery_stage(job, stage, "complete")
+                else:
+                    self._log_delivery_stage(
+                        job, "starttls", "skipped",
+                        reason="ssl_transport" if self.config.use_ssl else "disabled",
                     )
 
-        job["pending_recipients"] = failed_recipients
-        if failed_recipients:
-            raise smtplib.SMTPException(
-                f"Delivery failed for {len(failed_recipients)} recipient(s)"
+                if self.config.username:
+                    stage = "authentication"
+                    self._log_delivery_stage(job, stage, "started")
+                    smtp.login(self.config.username, self.config.password)
+                    self._log_delivery_stage(job, stage, "complete")
+                else:
+                    self._log_delivery_stage(
+                        job, "authentication", "skipped",
+                        reason="username_not_configured",
+                    )
+
+                failed_recipients = []
+                recipient_count = len(job["pending_recipients"])
+                for index, recipient in enumerate(
+                    job["pending_recipients"], start=1
+                ):
+                    stage = "recipient_submit"
+                    self._log_delivery_stage(
+                        job, stage, "started",
+                        recipient_index=f"{index}/{recipient_count}",
+                    )
+                    try:
+                        refused = smtp.sendmail(
+                            self.config.sender,
+                            [recipient],
+                            message.as_string(),
+                        )
+                    except (OSError, smtplib.SMTPException) as error:
+                        self._log_delivery_stage(
+                            job, stage, "failed",
+                            recipient_index=f"{index}/{recipient_count}",
+                            error_type=type(error).__name__,
+                            detail=self._safe_error_detail(error),
+                        )
+                        failed_recipients.append(recipient)
+                        continue
+                    if refused:
+                        status, response = refused.get(recipient, (None, b""))
+                        failed_recipients.append(recipient)
+                        self._log_delivery_stage(
+                            job, stage, "refused",
+                            recipient_index=f"{index}/{recipient_count}",
+                            smtp_status=status,
+                            detail=self._safe_error_detail(Exception(response)),
+                        )
+                    else:
+                        self._log_delivery_stage(
+                            job, stage, "accepted",
+                            recipient_index=f"{index}/{recipient_count}",
+                        )
+                stage = "smtp_disconnect"
+                self._log_delivery_stage(job, stage, "started")
+
+            self._log_delivery_stage(job, "smtp_disconnect", "complete")
+            job["pending_recipients"] = failed_recipients
+            stage = "smtp_submission"
+            if failed_recipients:
+                self._log_delivery_stage(
+                    job, "smtp_submission", "incomplete",
+                    failed_recipients=len(failed_recipients),
+                )
+                raise smtplib.SMTPException(
+                    f"Delivery failed for {len(failed_recipients)} recipient(s)"
+                )
+            self._log_delivery_stage(job, "smtp_submission", "accepted")
+        except Exception as error:
+            self._log_delivery_stage(
+                job, stage, "failed",
+                error_type=type(error).__name__,
+                detail=self._safe_error_detail(error),
             )
+            raise
 
     @staticmethod
     def _format_body(event):

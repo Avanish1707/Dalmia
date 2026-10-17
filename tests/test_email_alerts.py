@@ -175,10 +175,17 @@ def test_email_queue_sends_event_and_snapshot_off_worker_thread(
     assert "Evidence: https://example.test/alerts/evidence.jpg" in body
     assert attachment_part.get_filename() == "evidence.jpg"
     assert thread_ids[0] != camera_thread_id
-    assert "stage=complete result=smtp_accepted" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "attempt=1" in output
+    assert "stage=smtp_connect result=complete" in output
+    assert "stage=starttls result=complete" in output
+    assert "stage=authentication result=complete" in output
+    assert "stage=recipient_submit result=accepted" in output
+    assert "stage=smtp_submission result=accepted" in output
+    assert "stage=complete result=smtp_accepted" in output
 
 
-def test_email_retry_only_retries_refused_recipients(monkeypatch):
+def test_email_retry_only_retries_refused_recipients(monkeypatch, capsys):
     _set_mail_env(monkeypatch)
     config = EmailConfig.from_env()
     attempts = []
@@ -229,6 +236,12 @@ def test_email_retry_only_retries_refused_recipients(monkeypatch):
     ]
     assert job["pending_recipients"] == []
     assert len(set(message_ids)) == 1
+    output = capsys.readouterr().out
+    assert "stage=recipient_submit result=refused" in output
+    assert "attempt=1" in output
+    assert "attempt=2" in output
+    assert "stage=smtp_submission result=incomplete" in output
+    assert "stage=smtp_submission result=accepted" in output
 
 
 def test_email_delivery_failure_logs_stage_and_redacts_credentials(
@@ -257,9 +270,12 @@ def test_email_delivery_failure_logs_stage_and_redacts_credentials(
 
     output = capsys.readouterr().out
     assert "[EMAIL][DELIVERY] stage=attempt" in output
+    assert "stage=smtp_connect result=started" in output
+    assert "stage=smtp_connect result=failed" in output
     assert "[EMAIL][DELIVERY] stage=complete result=failed" in output
     assert "connection failed for [redacted]" in output
     assert config.password not in output
+    assert all(recipient not in output for recipient in config.recipients)
 
 
 def test_smtp_authentication_error_is_logged_and_not_retried(
@@ -307,6 +323,8 @@ def test_smtp_authentication_error_is_logged_and_not_retried(
     output = capsys.readouterr().out
     assert attempts == ["login"]
     assert "error_type=SMTPAuthenticationError" in output
+    assert "stage=authentication result=failed" in output
+    assert "attempt=1" in output
     assert "correlation_id=correlation-2" in output
     assert "[redacted]" in output
     assert config.password not in output

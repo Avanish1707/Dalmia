@@ -312,10 +312,16 @@ field presence only (never values); if mail configuration is invalid, camera
 inference and Flask remain available while email jobs are rejected with a
 clear service-unavailable response. `stage=queue result=failed` means the
 event was not accepted by the queue. `[EMAIL][DELIVERY] stage=attempt`
-confirms SMTP delivery began; `stage=complete result=failed` reports the
-sanitized SMTP error, and `result=smtp_accepted` means the configured SMTP
-server accepted the submission, not that delivery to the recipient's inbox
-was verified.
+confirms SMTP delivery began. Follow the same `event_id` or `correlation_id`
+through `stage=message_build`, `stage=smtp_connect`, `stage=starttls`,
+`stage=authentication`, and each `stage=recipient_submit` entry to identify
+the first failed step; use the `attempt` field to distinguish retries. Disabled
+TLS or authentication is logged as skipped.
+Recipient addresses and credentials are not included in these stage logs.
+`stage=complete result=failed` reports the sanitized error, while
+`stage=smtp_submission result=accepted` means the configured SMTP server
+accepted the submission, not that delivery to the recipient's inbox was
+verified.
 
 Only confirmed unknown-face detections from the camera worker are sent through
 the detection email queue. They do not emit `face_alert` or
